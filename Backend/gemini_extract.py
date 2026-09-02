@@ -259,8 +259,13 @@ def build_schema(metric_keys):
                 "fy26_q3_value": {"type": ["number", "null"]},
                 "fy25_q3_value": {"type": ["number", "null"]},
                 "found": {"type": "boolean"},
+                "source_form": {"type": ["string", "null"]},
+                "page_number": {"type": ["integer", "null"]},
+                "evidence": {"type": ["string", "null"]},
+                "notes": {"type": ["string", "null"]},
             },
-            "required": ["fy26_q3_value", "fy25_q3_value", "found"],
+            "required": ["fy26_q3_value", "fy25_q3_value", "found",
+                         "source_form", "page_number", "evidence", "notes"],
         }
     return {
         "type": "object",
@@ -278,6 +283,8 @@ For EACH metric listed below (its own description states its unit - Rs. Lakhs, a
   - fy25_q3_value: cumulative value for the prior year (period ended 31 Dec 2024), or null if the schedule has no prior-year comparative
 Convert "(1,234)" style parentheses to a negative number; treat "-" as 0. If a metric is genuinely not present anywhere in the provided tables, set found=false and both values to null - do not guess, estimate, or compute a value that isn't directly shown.
 
+For EVERY metric (found or not), also report: source_form (the form_name string from the JSON block you found it in, e.g. "Investment Schedule (NL-12 & 12A)" - null if not found), page_number (that page's "page_index" value from the JSON, PLUS ONE, i.e. 1-based - null if not found), evidence (the exact row label and cell text you read the value from, as printed, e.g. "Gross Direct Premium: 2,394.98" - null if not found), and notes (a short note on anything non-obvious about this extraction - e.g. "used the 'Up to the Period Ended' column at a stacked-block year layout", "value read from the schedule's own TOTAL row" - null if nothing worth noting). These are for a human audit trail, not used to compute anything - keep them factual and short.
+
 Where a schedule breaks amounts down by class of business (Health / Personal Accident / Travel / etc.), use the GRAND TOTAL / overall company figure, not a single class, unless the metric explicitly says otherwise.
 
 IMPORTANT for any metric described as a percentage or ratio (e.g. Combined Ratio, Loss Ratio, Expense of Management Ratio): insurers format the SAME ratio inconsistently across these source documents - some print an explicit percentage like "111.88%", others print the bare decimal multiple with no "%" sign, e.g. "1.11" (which ALSO means 111%, just written as a multiple instead of a percentage). Always normalize your reported number to the "percentage-with-%-removed" scale: if the source cell has a "%" sign, report the number as printed (111.88% -> 111.88); if the source cell has NO "%" sign but is clearly the same kind of ratio (a bare decimal typically between 0 and ~20 for things like Combined/Loss/Expense ratios), MULTIPLY it by 100 before reporting (1.11 -> 111). The output must always be consistent: a metric worth "around 100" should be reported as ~100, never as ~1. "No. of times" ratios explicitly described as such (e.g. Solvency Ratio) are the one exception - report those as printed, unscaled.
@@ -292,7 +299,10 @@ Source tables (JSON):
 
 def extract_metrics_via_gemini(company, payload, metric_specs):
     """metric_specs: list of {"key":..., "description":...}. Returns
-    {key: {"fy26_q3": float|None, "fy25_q3": float|None, "found": bool}}."""
+    {key: {"fy26_q3": float|None, "fy25_q3": float|None, "found": bool,
+    "source_form": str|None, "page_number": int|None, "evidence": str|None,
+    "notes": str|None}} - the last four are an audit trail (which form/page/
+    row the value was read from), not used in any downstream computation."""
     metric_keys = [m["key"] for m in metric_specs]
     metric_list = "\n".join(f"- {m['key']}: {m['description']}" for m in metric_specs)
     tables_json = json.dumps(payload, ensure_ascii=False, default=str)
@@ -317,6 +327,10 @@ def extract_metrics_via_gemini(company, payload, metric_specs):
             "fy26_q3": v.get("fy26_q3_value"),
             "fy25_q3": v.get("fy25_q3_value"),
             "found": v.get("found", False),
+            "source_form": v.get("source_form"),
+            "page_number": v.get("page_number"),
+            "evidence": v.get("evidence"),
+            "notes": v.get("notes"),
         }
     return out
 

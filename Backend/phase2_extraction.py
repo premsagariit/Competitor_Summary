@@ -10,6 +10,7 @@ runs:
 import argparse
 import json
 import math
+import os
 import re
 import sys
 
@@ -1186,7 +1187,36 @@ def apply_company_gemini_pipeline(ws, company, dry_run=False):
         else:
             written += apply_metric_to_rows(ws, idx, slide, company, metric1, metric2, cur, prior, dry_run, log)
 
+    write_extraction_audit(company, raw, rows_by_key, kind_by_key, derived)
+
     return written, log, raw
+
+
+def write_extraction_audit(company, raw, rows_by_key, kind_by_key, derived):
+    """Persists, per company, exactly which Excel cell every LLM-extracted or
+    Python-derived value was written to, alongside the LLM's own evidence
+    fields (source_form/page_number/evidence/notes) - so any filled Excel
+    cell can be traced back to source form/page/table evidence."""
+    entries = []
+    for key, v in raw.items():
+        entries.append({
+            "key": key, "source": "llm", "kind": kind_by_key.get(key),
+            "fy26_q3": v.get("fy26_q3"), "fy25_q3": v.get("fy25_q3"), "found": v.get("found"),
+            "source_form": v.get("source_form"), "page_number": v.get("page_number"),
+            "evidence": v.get("evidence"), "notes": v.get("notes"),
+            "target_rows": [{"slide": s, "metric1": m1, "metric2": m2} for (s, m1, m2) in rows_by_key.get(key, [])],
+        })
+    for (slide, metric1, metric2), (cur, prior) in derived.items():
+        entries.append({
+            "key": None, "source": "derived",
+            "fy26_q3": cur, "fy25_q3": prior,
+            "target_rows": [{"slide": slide, "metric1": metric1.removeprefix("__SLIDE12__"), "metric2": metric2}],
+        })
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", company)
+    out_dir = os.path.join("cache", "extraction_audit", "FY26", "Q3")
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, f"{safe}.json"), "w", encoding="utf-8") as f:
+        json.dump({"company": company, "entries": entries}, f, ensure_ascii=False, indent=2, default=str)
 
 
 def main():
