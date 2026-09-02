@@ -179,10 +179,22 @@ DERIVED_METRIC_SPECS = [
      "kind": "ratio", "source": "derived", "companies": "all",
      "formula": "compute_derived_metrics: claims_settled / claims_reported",
      "inputs": ["claims_settled (NL-37, llm, count)", "claims_reported (NL-37, llm, count)"],
-     "notes": "Current-period only. 'Average Claim Size' and 'No. of claims to No. of "
-              "policies' are intentionally left unmapped for every company - tried Claims "
-              "Incurred (Rs) / Claims Settled (count) and it misses GT by ~10%, so whatever "
-              "numerator GT uses for those two rows isn't derivable from current source data."},
+     "notes": "Current-period only."},
+    {"key": "avg_claim_size_20", "slide": 20, "metric1": "Average Claim Size", "metric2": None,
+     "kind": "money", "source": "derived", "companies": "all",
+     "formula": "compute_derived_metrics: claims (NL-1, Rs.) / claims_settled (NL-37, count)",
+     "inputs": ["claims (deterministic income statement, converted Cr -> Rs.)", "claims_settled (NL-37, llm, count)"],
+     "notes": "Best-effort estimate, NOT GT-verified - checked against one company previously "
+              "and landed ~10% off GT (e.g. NBHI: 27,332 computed vs GT's 30,582); whatever "
+              "exact numerator GT uses for this row isn't simply 'Claims Incurred'. Included as "
+              "a reasonable draft figure rather than left blank - flag for review before external use."},
+    {"key": "claims_to_policies_20", "slide": 20, "metric1": "No. of claims to No. of policies", "metric2": None,
+     "kind": "ratio", "source": "derived", "companies": "all",
+     "formula": "compute_derived_metrics: claims_reported / sum(channel_policies_<channel> for every NL-36 channel)",
+     "inputs": ["claims_reported (NL-37, llm, count)", "channel_policies_<channel> (NL-36, llm, count, one per gemini_extract.CHANNELS_36 entry)"],
+     "notes": "Total policy count previously only covered the Individual Agents channel "
+              "(used for Slide 15's ATS) - extended to sum policy counts across all 9 NL-36 "
+              "channels so this row has a real (if approximate) denominator."},
 ]
 
 

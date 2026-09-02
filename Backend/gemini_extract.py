@@ -216,14 +216,22 @@ def master_metric_specs():
     for form_label, metric2 in CHANNELS_36:
         add(f"channel_premium_{metric2}", f"Premium (Rs. Lakhs) for the '{form_label}' channel, from the Business-Channels Wise Schedule (NL-36).",
             ["NL-36"], "money", [])
-    add("channel_policies_individual_agents", "Number of Policies (a count, not Rs.) for the 'Individual Agents' channel, from the Business-Channels Wise Schedule (NL-36).",
-        ["NL-36"], "count", [])
+    # Number of Policies per channel, for every channel (not just Individual
+    # Agents - that was the only one extracted previously) - summed in
+    # Python to give the company's total policy count, the denominator
+    # Slide 20's "No. of claims to No. of policies" needs. Reuses the same
+    # NL-36 payload already fetched for channel_premium_*, no extra PDF I/O.
+    for form_label, metric2 in CHANNELS_36:
+        add(f"channel_policies_{metric2}", f"Number of Policies (a count, not Rs.) for the '{form_label}' channel, from the Business-Channels Wise Schedule (NL-36).",
+            ["NL-36"], "count", [])
 
     # --- NL-37 Claims Data ---
-    # (NL-37 reports claim COUNTS, not a pre-computed ratio; combined into
-    # slide20's Claims Settlement Ratio in Python. Average Claim Size and
-    # claims-to-policies need claim AMOUNTS / total policy counts this
-    # schedule doesn't carry, so are left as an accepted gap.)
+    # (NL-37 reports claim COUNTS, not a pre-computed ratio; combined with
+    # NL-36's total policy count and NL-1's Claims amount in Python for
+    # Slide 20's Claims Settlement Ratio / Average Claim Size / No. of
+    # claims to policies. Average Claim Size is a best-effort estimate -
+    # verified ~10% off GT for at least one company - flagged as such
+    # wherever it's written.)
     add("claims_os_start", "'Claims O/S at the beginning of the period', Total (overall company, rightmost/Total column), from the Claims Data Schedule (NL-37) - a claim COUNT, not an amount.",
         ["NL-37"], "count", [])
     add("claims_reported", "'Claims reported during the period', Total (overall company, rightmost/Total column), from the Claims Data Schedule (NL-37) - a claim COUNT, not an amount.",

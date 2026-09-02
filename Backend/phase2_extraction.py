@@ -1105,7 +1105,7 @@ def compute_derived_metrics(company, converted, income):
 
     # Slide 15: Individual ATS (Rs per policy) and Average Productivity (Rs per agent)
     prem_ia_cur, prem_ia_prior = get("channel_premium_Individual Agents")
-    pol_ia_cur, pol_ia_prior = get("channel_policies_individual_agents")
+    pol_ia_cur, pol_ia_prior = get("channel_policies_Individual Agents")
     D[(15, "Individual ATS", "Individual agents GWP/Individual agents no. of policies")] = (
         round(prem_ia_cur * 1e7 / pol_ia_cur, 2) if prem_ia_cur and pol_ia_cur else None,
         round(prem_ia_prior * 1e7 / pol_ia_prior, 2) if prem_ia_prior and pol_ia_prior else None,
@@ -1121,11 +1121,27 @@ def compute_derived_metrics(company, converted, income):
     settled_cur, _ = get("claims_settled")
     reported_cur, _ = get("claims_reported")
     D[(20, "Claims Settlement Ratio", None)] = (safe_div(settled_cur, reported_cur), None)
-    # NOTE: Slide 20's "Average Claim Size" is intentionally left unmapped -
-    # tried Claims Incurred (NL-1, Rs) / Claims Settled (NL-37, count) and it
-    # misses GT by ~10% (e.g. NBHI: 27,332 computed vs GT's 30,582), so
-    # whatever exact numerator GT uses isn't "Claims Incurred". Not worth
-    # guessing further and risking a wrong-but-filled cell.
+
+    # Total policy count = sum of Number of Policies across every NL-36
+    # channel (previously only Individual Agents' count was extracted).
+    total_policies_cur = 0
+    any_policy_count = False
+    for _, metric2 in gemini_extract.CHANNELS_36:
+        c, _ = get(f"channel_policies_{metric2}")
+        if c is not None:
+            total_policies_cur += c
+            any_policy_count = True
+    total_policies_cur = total_policies_cur if any_policy_count else None
+
+    claims_cur, _ = income.get("claims", (None, None))
+    if claims_cur is not None and settled_cur:
+        # Best-effort estimate, not GT-verified: tried against one company
+        # previously and landed ~10% off GT (e.g. NBHI: 27,332 computed vs
+        # GT's 30,582) - whatever exact numerator GT uses for this row isn't
+        # simply "Claims Incurred", but this is a reasonable draft figure.
+        D[(20, "Average Claim Size", None)] = (round(claims_cur * 1e7 / settled_cur, 2), None)
+    if reported_cur is not None and total_policies_cur:
+        D[(20, "No. of claims to No. of policies", None)] = (round(reported_cur / total_policies_cur, 6), None)
 
     return D
 
@@ -1168,6 +1184,7 @@ def apply_company_gemini_pipeline(ws, company, dry_run=False):
         "pbt_for_quarter": inc.get("PBT (For the Quarter)", (None, None)),
         "pat": inc.get("PAT", (None, None)),
         "investment_yield": inc.get("Investment Yield", (None, None)),
+        "claims": inc.get("Claims", (None, None)),
     }
 
     idx = build_row_index(ws)

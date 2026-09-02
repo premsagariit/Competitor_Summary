@@ -12,9 +12,14 @@ Phase 3 plan for the reasoning):
   - "Historical Trends" (Slides 27-31) render as a 2-period (FY25_Q3 vs
     FY26_Q3) grouped-column comparison, not an 8-year line - the Data
     Engine only carries 2 periods.
-  - Slide 16 (Geographic zones) and 2 of Slide 20's 3 sub-metrics have no
-    FY26 Q3 data at all (documented gaps from Phase 2) - rendered as an
-    explicit placeholder rather than a broken/empty chart.
+  - Slide 16 (Geographic zones) is derived from Slide 17's named-state data
+    via a standard state-to-zone mapping, not extracted directly - North/
+    West/South are covered, East/Central fall inside an "Others
+    (unclassified)" bucket since no East/Central state is individually
+    broken out by current source disclosures. Slide 20's Average Claim Size
+    and No. of claims to policies are best-effort estimates (not
+    independently GT-verified) rather than raw extracted figures - both
+    documented on their slide's footnote and in the Glossary.
   - Insight bullets are rule-based (leader/laggard + YoY direction), not
     human analyst commentary - meant as a first-pass, fully editable draft.
   - Narayana Health and Galaxy Health are included wherever the Data Engine
@@ -209,6 +214,8 @@ def glossary_slide(prs, page_no):
         "Above information is as per public disclosures available on IRDAI/company websites for the quarter ended 31 Dec 2025 (FY26 Q3), compared to the quarter ended 31 Dec 2024 (FY25 Q3).",
         "SAHI = Stand-alone Health Insurer. GDPI = Gross Direct Premium Income. GWP = Gross Written Premium. NWP = Net Written Premium.",
         "“Historical Trends” slides in this FY26 Q3 report show a 2-period (FY25 Q3 vs FY26 Q3) year-on-year comparison, not multi-year history - the underlying data pipeline currently carries only these 2 periods.",
+        "Slide 16's zone split (North/West/South) is derived from Slide 17's named-state data using the standard Ministry of Home Affairs zonal convention; East and Central exposure isn't separately identifiable from current source disclosures and is included in “Others (unclassified)”.",
+        "Slide 20's Average Claim Size and No. of claims to No. of policies are best-effort estimates, not independently GT-verified - Average Claim Size (Claims Incurred / Claims Settled) has previously landed ~10% off ground truth for at least one company; review before external use.",
         "Company short names: NBHI = Niva Bupa Health Insurance, STAR = Star Health & Allied Insurance, CARE = Care Health Insurance, CIGNA = ManipalCigna Health Insurance, ABHI = Aditya Birla Health Insurance, Narayana = Narayana Health Insurance, Galaxy = Galaxy Health Insurance.",
         "This report was generated automatically from Data_Engine_UI.xlsx; insight bullets are rule-based auto-generated observations and should be reviewed before external use.",
     ]
@@ -519,18 +526,53 @@ def slide_15(prs, rows):
     return metric_panels_slide(prs, rows, 15, "ATS", 15, panels)
 
 
+STATES8 = ["Uttar Pradesh", "Maharashtra", "Karnataka", "Haryana", "Tamil Nadu", "Kerala", "Delhi", "Others"]
+
+# Standard Indian zonal classification (Ministry of Home Affairs zonal
+# council convention), applied to whichever of the 8 Slide 17 state buckets
+# fall in each zone. Only these 7 named states are individually broken out
+# by the source disclosures - "Others" is a residual across every
+# unlisted state, which necessarily spans multiple zones (including the
+# entirety of the East and Central zones) and can't be disaggregated
+# further from current source data, so it's kept as its own "Others
+# (unclassified)" bucket rather than guessed at.
+STATE_TO_ZONE = {
+    "Uttar Pradesh": "North", "Haryana": "North", "Delhi": "North",
+    "Maharashtra": "West",
+    "Karnataka": "South", "Tamil Nadu": "South", "Kerala": "South",
+}
+
+
 def slide_16(prs, rows):
+    cdata = data.by_company(rows, 17, theme.canonical_company)  # Slide 17's state-share data, re-aggregated
+    keys = [k for k in data.COMPANY_ORDER if k in cdata]
+    names = disp_names(keys)
+    zones = ["North", "West", "South", "Others (unclassified)"]
+
+    def zone_value(company_key, zone):
+        if zone == "Others (unclassified)":
+            states = [s for s in STATES8 if s not in STATE_TO_ZONE]
+        else:
+            states = [s for s, z in STATE_TO_ZONE.items() if z == zone]
+        vals = [cdata[company_key].get((s, None), (None, None))[0] for s in states]
+        vals = [v for v in vals if v is not None]
+        return round(sum(vals), 4) if vals else None
+
+    series = {z: [zone_value(k, z) for k in keys] for z in zones}
+    colors = {"North": theme.SEGMENT_COLORS["Public"], "West": theme.SEGMENT_COLORS["Private"],
+              "South": theme.SEGMENT_COLORS["SAHI"], "Others (unclassified)": theme.LIGHT_GREY}
     slide = new_content_slide(prs, "Geographical Distribution: Zones", 16)
-    theme.add_placeholder_panel(
-        slide, "Zone-level (Central/East/North/South/West) GDPI mapping is not derivable from current source "
-               "disclosures - not available for FY26 Q3.",
-        CONTENT_LEFT, PANEL_TOP0, CONTENT_WIDTH, Inches(6.0))
-    theme.add_insight_panel(slide, ["This slide requires a state-to-zone mapping not present in current source data."],
+    theme.add_panel_frame(slide, CONTENT_LEFT, PANEL_TOP0, CONTENT_WIDTH, Inches(5.6))
+    charts.stacked_100_column(slide, names, series, colors, CONTENT_LEFT + Inches(0.2), PANEL_TOP0 + Inches(0.3),
+                               CONTENT_WIDTH - Inches(0.4), Inches(5.0))
+    theme.add_note(slide, "North/West/South derived from Slide 17's named states (Ministry of Home Affairs zonal "
+                           "convention); East and Central aren't separately broken out by current source "
+                           "disclosures and fall inside 'Others (unclassified)'.",
+                    CONTENT_LEFT, PANEL_TOP0 + Inches(5.65), CONTENT_WIDTH, Inches(0.45))
+    theme.add_insight_panel(slide, ["Zone split is a best-effort estimate from named-state data - East/Central "
+                                     "exposure isn't separately identifiable this quarter."],
                              CONTENT_LEFT, INSIGHT_TOP, CONTENT_WIDTH, INSIGHT_HEIGHT)
     return slide
-
-
-STATES8 = ["Uttar Pradesh", "Maharashtra", "Karnataka", "Haryana", "Tamil Nadu", "Kerala", "Delhi", "Others"]
 
 
 def slide_17(prs, rows):
@@ -596,9 +638,14 @@ def slide_20(prs, rows):
     panels = [
         {"title": "Claims Settlement Ratio", "metric1": "Claims Settlement Ratio", "metric2": None,
          "kind": "percent", "mode": "single"},
+        {"title": "Average Claim Size (Rs.)", "metric1": "Average Claim Size", "metric2": None,
+         "kind": "money", "mode": "single"},
+        {"title": "No. of Claims to No. of Policies", "metric1": "No. of claims to No. of policies", "metric2": None,
+         "kind": "percent", "mode": "single", "higher_is_better": False},
     ]
     return metric_panels_slide(prs, rows, 20, "Key Metrics", 20, panels,
-                                footnote="Average Claim Size and No. of claims to policies are not derivable from current source data.")
+                                footnote="Average Claim Size and No. of claims to policies are best-effort estimates "
+                                         "(not independently GT-verified) - see Glossary.")
 
 
 def slide_21(prs, rows):
