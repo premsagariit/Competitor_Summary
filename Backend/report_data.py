@@ -83,10 +83,23 @@ def by_company(rows, slide_no, canonical_fn, key_field="Company"):
 def metric_series(company_data, metric1, metric2=None, companies=COMPANY_ORDER):
     """Given by_company()'s output, returns (companies_present, prior_values,
     current_values) for one (metric1, metric2) pair, in COMPANY_ORDER,
-    skipping companies with no data for it at all."""
+    skipping companies with no data for it at all.
+
+    metric2=None means "match this metric1 regardless of the stored Metric 2"
+    (the same convention phase2_extraction.apply_metric_to_rows uses) -
+    Metric 2 is sometimes a static per-company annotation rather than a
+    disambiguating key (e.g. Slide 8's NBHI row carries "Health + PA +
+    Travel" while every other company's row there is bare None; an exact-
+    match lookup would silently drop NBHI). Callers that need one specific
+    variant among several for the same metric1 (e.g. Slide 30's "Risk
+    Ceded") pass that metric2 string explicitly, which still matches exactly."""
     keys, prior, current = [], [], []
     for c in companies:
-        pair = company_data.get(c, {}).get((metric1, metric2))
+        cdata = company_data.get(c, {})
+        if metric2 is None:
+            pair = next((v for (m1, m2), v in cdata.items() if m1 == metric1), None)
+        else:
+            pair = cdata.get((metric1, metric2))
         if pair is None:
             continue
         cur, pr = pair
