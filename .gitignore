@@ -1,0 +1,6 @@
+Backend/myenv/
+Backend/.env
+**/__pycache__/
+*.pyc
+~$*.xlsx
+.claude/scheduled_tasks.lock

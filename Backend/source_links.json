@@ -1,0 +1,34 @@
+{
+  "GIC": {
+    "name": "General Insurance Council (Industry-wide data)",
+    "quarterly_disclosure_page_link": "https://www.gicouncil.in/segmentwise-report"
+  },
+  "Niva Bupa Health Insurance": {
+    "name": "Niva Bupa Health Insurance Company Limited",
+    "quarterly_disclosure_page_link": "https://transactions.nivabupa.com/pages/public-disclosures.aspx"
+  },
+  "Aditya Birla Health Insurance": {
+    "name": "Aditya Birla Health Insurance Co. Limited",
+    "quarterly_disclosure_page_link": "https://www.adityabirlacapital.com/healthinsurance/downloads"
+  },
+  "Care Health Insurance": {
+    "name": "Care Health Insurance Ltd",
+    "quarterly_disclosure_page_link": "https://www.careinsurance.com/public-disclosures.html"
+  },
+  "Galaxy Health Insurance": {
+    "name": "Galaxy Health Insurance Company Ltd",
+    "quarterly_disclosure_page_link": "https://www.galaxyhealth.com/public-disclosures"
+  },
+  "ManipalCigna Health Insurance": {
+    "name": "ManipalCigna Health Insurance Co Ltd",
+    "quarterly_disclosure_page_link": "https://www.manipalcigna.com/disclosures/public-disclosures"
+  },
+  "Narayana Health Insurance": {
+    "name": "Narayana Health Insurance Ltd",
+    "quarterly_disclosure_page_link": "https://www.narayanahealth.insurance/disclosures-report"
+  },
+  "Star Health & Allied Insurance": {
+    "name": "Star Health & Allied Insurance Co Ltd",
+    "quarterly_disclosure_page_link": "https://www.starhealth.in/media-center/"
+  }
+}
