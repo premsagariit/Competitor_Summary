@@ -3,27 +3,27 @@ Row-key alignment: 818 rows in mine, 818 in GT, 818 keys match, 0 of mine have n
 ===== SUMMARY (FY26_Q3/FY25_Q3 scored independently) =====
 Numeric GT values (denominator): 1333
   Correctly extracted & matching GT: 995
-  Filled but WRONG (mismatch vs GT):  109
-  GT has a value, we left blank (missed): 229
-We filled a GT-blank slot (extra/unverified, source-supported fill): 125
-Both blank: 97
+  Filled but WRONG (mismatch vs GT):  110
+  GT has a value, we left blank (missed): 228
+We filled a GT-blank slot (extra/unverified, source-supported fill): 126
+Both blank: 96
 
 Accuracy (correct / numeric-GT): 74.6%
-Coverage (attempted / numeric-GT): 82.8%
+Coverage (attempted / numeric-GT): 82.9%
 
 ===== NON-NUMERIC GT VALUES (excluded from accuracy - not extraction failures) =====
   Dash ('-'): 53  (46 of these we filled with a value anyway)
-  Formula error (#VALUE!/#N/A/...): 28  (16 of these we filled with a value anyway)
+  Formula error (#VALUE!/#N/A/...): 28  (22 of these we filled with a value anyway)
 
 ===== BY COMPANY =====
   ABHI: correct=111 wrong=8 missing=33 extra=16  (n=168)
   Star Health: correct=118 wrong=8 missing=22 extra=16  (n=164)
+  Manipal Cigna: correct=106 wrong=7 missing=33 extra=16  (n=162)
   NBHI: correct=108 wrong=8 missing=30 extra=16  (n=162)
-  Manipal Cigna: correct=106 wrong=7 missing=33 extra=14  (n=160)
   Galaxy Health: correct=94 wrong=8 missing=25 extra=32  (n=159)
-  Care Health: correct=85 wrong=11 missing=46 extra=16  (n=158)
-  Narayana Health: correct=51 wrong=25 missing=26 extra=15  (n=117)
-  GDPI by Channel - SAHI: correct=80 wrong=1 missing=3 extra=0  (n=84)
+  Care Health: correct=85 wrong=11 missing=46 extra=14  (n=156)
+  Narayana Health: correct=53 wrong=26 missing=23 extra=16  (n=118)
+  GDPI by Channel - SAHI: correct=78 wrong=1 missing=5 extra=0  (n=84)
   Segment-wise GDPI mix - SAHI: correct=79 wrong=1 missing=0 extra=0  (n=80)
   Segment-wise GDPI mix: correct=10 wrong=30 missing=0 extra=0  (n=40)
   Industry: correct=34 wrong=0 missing=0 extra=0  (n=34)
@@ -112,9 +112,9 @@ Coverage (attempted / numeric-GT): 82.8%
   slide9 Narayana Health / SAHI Growth / GDPI Growth SAHI [prior]: gt=0
   slide9 STAR / SAHI Growth / GDPI Growth SAHI [prior]: gt=0.1309421815152396
   slide9 SAHI / SAHI Growth / GDPI Growth SAHI [prior]: gt=0.1854412696013465
-  slide12 GDPI by Channel - SAHI / Galaxy / Corporate Agents - Banks [prior]: gt=0
-  slide12 GDPI by Channel - SAHI / Galaxy / Corporate Agents - Others [prior]: gt=0
-  slide12 GDPI by Channel - SAHI / Galaxy / Brokers [prior]: gt=0
+  slide12 GDPI by Channel - SAHI / Narayana / Individual Agents [prior]: gt=0
+  slide12 GDPI by Channel - SAHI / Narayana / Corporate Agents - Banks [prior]: gt=0
+  slide12 GDPI by Channel - SAHI / Narayana / Corporate Agents - Others [prior]: gt=0
+  slide12 GDPI by Channel - SAHI / Narayana / Brokers [prior]: gt=0
+  slide12 GDPI by Channel - SAHI / Narayana / Direct Business [prior]: gt=1
   slide14 NBHI / Retail Accretion / Retail Revenue CY-Retail Revenue PY [prior]: gt=550.9000000000001
-  slide14 Star Health / Retail Accretion / Retail Revenue CY-Retail Revenue PY [prior]: gt=1130.429999999998
-  slide14 Care Health / Retail Accretion / Retail Revenue CY-Retail Revenue PY [prior]: gt=892.6999999999998
