@@ -329,8 +329,7 @@ def slide_08(pdf, rows):
                 bullets.append(f"{r['Company']} growth %: {v * 100:.1f}%")
     fig, panels, ins = new_page("Revenue Growth (GDPI)", 8, 1, want_insights=bool(bullets))
     panel_title(fig, panels[0], "Per-company GDPI (Rs. Crore)")
-    ax = fig.add_subplot(panels[0])
-    charts.grouped_bar(ax, disp_names(keys), prior, current)
+    charts.grouped_bar(fig, panels[0], disp_names(keys), prior, current)
     draw_insights(fig, ins, bullets[:4])
     pdf.savefig(fig)
     plt.close(fig)
@@ -344,8 +343,7 @@ def slide_09(pdf, rows):
     bullets = leader_laggard_bullets(keys, current, [None] * len(keys), "percent", "GDPI growth")
     fig, panels, ins = new_page("Revenue & Growth % (SAHI)", 9, 1, want_insights=bool(bullets))
     panel_title(fig, panels[0], "GDPI Growth % (YoY)")
-    ax = fig.add_subplot(panels[0])
-    charts.single_bar(ax, disp_names(keys), current, is_percent=True)
+    charts.single_bar(fig, panels[0], disp_names(keys), current, is_percent=True)
     draw_insights(fig, ins, bullets)
     pdf.savefig(fig)
     plt.close(fig)
@@ -452,12 +450,11 @@ def metric_panels_page(pdf, rows, slide_no, title, page_no, panels_def, footnote
     fig, panels, ins = new_page(title, page_no, len(resolved), want_insights=bool(bullets or footnote))
     for (pdef, keys, prior, current), spec in zip(resolved, panels):
         panel_title(fig, spec, pdef["title"])
-        ax = fig.add_subplot(spec)
         is_pct = pdef["kind"] == "percent"
         if pdef.get("mode", "grouped") == "single":
-            charts.single_bar(ax, disp_names(keys), current, is_percent=is_pct)
+            charts.single_bar(fig, spec, disp_names(keys), current, is_percent=is_pct)
         else:
-            charts.grouped_bar(ax, disp_names(keys), prior, current, is_percent=is_pct)
+            charts.grouped_bar(fig, spec, disp_names(keys), prior, current, is_percent=is_pct)
     # draw_insights only ever shows the first 4 lines - reserve a slot for
     # the footnote up front rather than appending it and having it silently
     # truncated away when there are already 4 leader/laggard bullets.
@@ -804,8 +801,7 @@ def slide_35(pdf, rows):
     idx = 0
     if has_off:
         panel_title(fig, panels[idx], "No. of Offices")
-        ax = fig.add_subplot(panels[idx])
-        charts.single_bar(ax, names, off_cur)
+        charts.single_bar(fig, panels[idx], names, off_cur)
         idx += 1
     if has_int:
         panel_title(fig, panels[idx], "Intermediaries by type")

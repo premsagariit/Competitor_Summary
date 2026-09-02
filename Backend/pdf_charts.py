@@ -41,6 +41,71 @@ def _num_fmt(v):
     return f"{v:,.0f}"
 
 
+def _outlier_break(values, ratio_threshold=5):
+    """Classifies values into an 'outlier' cluster (anything more than
+    ratio_threshold times the MEDIAN positive value) and a 'normal'
+    cluster, returning (bottom_cluster_max, overall_max) marking where a
+    broken y-axis should split the chart, or None if nothing is dominant
+    enough to need one.
+
+    The median is used as the reference point (not the single largest
+    adjacent-value gap) specifically because a "staircase" of several
+    moderately-spaced outliers can collectively dwarf the normal cluster
+    without any ONE adjacent pair crossing a gap threshold - e.g. two very
+    new/small insurers at 2145% and 913% are only ~2.3x apart from each
+    other, so a gap-based check misses that both are enormous relative to
+    a normal ~100-135% cluster; comparing every value against the robust
+    median catches this instead, and naturally groups any number of
+    simultaneous outliers into one shared 'top' panel."""
+    positive = sorted({v for v in values if v is not None and v > 0})
+    if len(positive) < 2:
+        return None
+    n = len(positive)
+    median = positive[n // 2] if n % 2 else (positive[n // 2 - 1] + positive[n // 2]) / 2
+    if median <= 0:
+        return None
+    cutoff = median * ratio_threshold
+    bottom = [v for v in positive if v <= cutoff]
+    top = [v for v in positive if v > cutoff]
+    if not bottom or not top:
+        return None
+    return max(bottom), max(top)
+
+
+def _style_bar_axes(ax, is_percent):
+    ax.tick_params(axis="y", labelsize=7)
+    if is_percent:
+        ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(axis="y", color=theme.GRID_COLOR, linewidth=0.6, zorder=0)
+    ax.set_axisbelow(True)
+
+
+def _make_broken_axes(fig, subplot_spec, top_ratio=0.32):
+    inner = gridspec.GridSpecFromSubplotSpec(2, 1, subplot_spec=subplot_spec,
+                                              height_ratios=[top_ratio, 1], hspace=0.08)
+    ax_top = fig.add_subplot(inner[0])
+    ax_bot = fig.add_subplot(inner[1])
+    return ax_top, ax_bot
+
+
+def _finish_broken_axes(ax_top, ax_bot, bottom_max, top_max, is_percent, lo=0.0):
+    ax_bot.set_ylim(lo, bottom_max * 1.28)
+    ax_top.set_ylim(bottom_max * 1.28, top_max * 1.15)
+    for ax in (ax_top, ax_bot):
+        _style_bar_axes(ax, is_percent)
+    ax_top.spines["bottom"].set_visible(False)
+    ax_bot.spines["top"].set_visible(False)
+    ax_top.tick_params(bottom=False, labelbottom=False)
+    d = 0.012
+    kwargs = dict(transform=ax_top.transAxes, color="black", clip_on=False, linewidth=0.9)
+    ax_top.plot((-d, d), (-2 * d, 2 * d), **kwargs)
+    ax_top.plot((1 - d, 1 + d), (-2 * d, 2 * d), **kwargs)
+    kwargs["transform"] = ax_bot.transAxes
+    ax_bot.plot((-d, d), (1 - d, 1 + d), **kwargs)
+    ax_bot.plot((1 - d, 1 + d), (1 - d, 1 + d), **kwargs)
+
+
 def doughnut_pair(fig, subplot_spec, prior_title, current_title, labels, prior_values, current_values,
                    colors, unit_label=None):
     """Two side-by-side doughnuts (prior/current) with each ring's total in
@@ -82,8 +147,8 @@ def doughnut_pair(fig, subplot_spec, prior_title, current_title, labels, prior_v
     return True
 
 
-def grouped_bar(ax, categories, prior_values, current_values, prior_label="FY25 Q3", current_label="FY26 Q3",
-                 is_percent=False, higher_is_better=True):
+def grouped_bar(fig, subplot_spec, categories, prior_values, current_values, prior_label="FY25 Q3",
+                 current_label="FY26 Q3", is_percent=False, higher_is_better=True):
     pairs = [(c, p, cu) for c, p, cu in zip(categories, prior_values, current_values)
              if p is not None or cu is not None]
     if not pairs:
@@ -91,43 +156,93 @@ def grouped_bar(ax, categories, prior_values, current_values, prior_label="FY25 
     cats = [p[0] for p in pairs]
     pri = [p[1] if p[1] is not None else 0 for p in pairs]
     cur = [p[2] if p[2] is not None else 0 for p in pairs]
-    x = range(len(cats))
+    x = list(range(len(cats)))
     w = 0.36
-    b1 = ax.bar([i - w / 2 for i in x], pri, width=w, label=prior_label, color=theme.PRIOR_COLOR)
-    b2 = ax.bar([i + w / 2 for i in x], cur, width=w, label=current_label, color=theme.CURRENT_COLOR)
     fmt = (lambda v: f"{v * 100:.1f}%") if is_percent else _num_fmt
-    for bars, vals in ((b1, pri), (b2, cur)):
-        ax.bar_label(bars, labels=[fmt(v) for v in vals], fontsize=6.5, padding=1)
-    _add_headroom(ax, pri + cur)
-    ax.set_xticks(list(x))
-    ax.set_xticklabels(cats, fontsize=8)
-    ax.tick_params(axis="y", labelsize=7)
-    if is_percent:
-        ax.yaxis.set_major_formatter(PercentFormatter(1.0))
-    ax.legend(fontsize=7, frameon=False, loc="upper right")
-    ax.spines[["top", "right"]].set_visible(False)
-    ax.grid(axis="y", color=theme.GRID_COLOR, linewidth=0.6, zorder=0)
-    ax.set_axisbelow(True)
+
+    def _draw(ax):
+        b1 = ax.bar([i - w / 2 for i in x], pri, width=w, label=prior_label, color=theme.PRIOR_COLOR)
+        b2 = ax.bar([i + w / 2 for i in x], cur, width=w, label=current_label, color=theme.CURRENT_COLOR)
+        ax.set_xticks(x)
+        return b1, b2
+
+    brk = _outlier_break(pri + cur)
+    if brk is None:
+        ax = fig.add_subplot(subplot_spec)
+        b1, b2 = _draw(ax)
+        for bars, vals in ((b1, pri), (b2, cur)):
+            ax.bar_label(bars, labels=[fmt(v) for v in vals], fontsize=6.5, padding=1)
+        _add_headroom(ax, pri + cur)
+        ax.set_xticklabels(cats, fontsize=8)
+        _style_bar_axes(ax, is_percent)
+        ax.legend(fontsize=7, frameon=False, loc="upper right")
+        return True
+
+    bottom_max, top_max = brk
+    ax_top, ax_bot = _make_broken_axes(fig, subplot_spec)
+    # Zero out each axis's copy of a bar that doesn't belong to its cluster
+    # (rather than drawing the real height everywhere and relying on ylim to
+    # clip the rest away) - clipping a real bar right at the axis boundary
+    # can leave a stray sliver of its top edge visible from anti-aliasing.
+    pri_top = [v if v > bottom_max else 0 for v in pri]
+    cur_top = [v if v > bottom_max else 0 for v in cur]
+    pri_bot = [v if v <= bottom_max else 0 for v in pri]
+    cur_bot = [v if v <= bottom_max else 0 for v in cur]
+    b1t, b2t = ax_top.bar([i - w / 2 for i in x], pri_top, width=w, label=prior_label, color=theme.PRIOR_COLOR), \
+        ax_top.bar([i + w / 2 for i in x], cur_top, width=w, label=current_label, color=theme.CURRENT_COLOR)
+    ax_top.set_xticks(x)
+    b1b = ax_bot.bar([i - w / 2 for i in x], pri_bot, width=w, label=prior_label, color=theme.PRIOR_COLOR)
+    b2b = ax_bot.bar([i + w / 2 for i in x], cur_bot, width=w, label=current_label, color=theme.CURRENT_COLOR)
+    ax_top.bar_label(b1t, labels=[fmt(v) if v else "" for v in pri_top], fontsize=6.5, padding=1)
+    ax_top.bar_label(b2t, labels=[fmt(v) if v else "" for v in cur_top], fontsize=6.5, padding=1)
+    ax_bot.bar_label(b1b, labels=[fmt(v) if v else "" for v in pri_bot], fontsize=6.5, padding=1)
+    ax_bot.bar_label(b2b, labels=[fmt(v) if v else "" for v in cur_bot], fontsize=6.5, padding=1)
+    lo = min(0, min(pri + cur))
+    _finish_broken_axes(ax_top, ax_bot, bottom_max, top_max, is_percent, lo=lo)
+    ax_bot.set_xticks(x)
+    ax_bot.set_xticklabels(cats, fontsize=8)
+    # The outlier company/companies (tall bars) are typically on the right
+    # (Narayana/Galaxy are last in COMPANY_ORDER) in both panels, so anchor
+    # the legend top-left in the (mostly empty) top panel instead of
+    # upper-right in the bottom panel, where it would tend to collide with
+    # whichever bar is tallest there.
+    ax_top.legend(fontsize=6.5, frameon=False, loc="upper left")
     return True
 
 
-def single_bar(ax, categories, values, is_percent=False, color=None):
+def single_bar(fig, subplot_spec, categories, values, is_percent=False, color=None):
     pairs = [(c, v) for c, v in zip(categories, values) if v is not None]
     if not pairs:
         return False
     cats = [p[0] for p in pairs]
     vals = [p[1] for p in pairs]
-    bars = ax.bar(cats, vals, color=color or theme.BLUE)
     fmt = (lambda v: f"{v * 100:.1f}%") if is_percent else _num_fmt
-    ax.bar_label(bars, labels=[fmt(v) for v in vals], fontsize=7, padding=1)
-    _add_headroom(ax, vals)
-    ax.tick_params(axis="x", labelsize=8)
-    ax.tick_params(axis="y", labelsize=7)
-    if is_percent:
-        ax.yaxis.set_major_formatter(PercentFormatter(1.0))
-    ax.spines[["top", "right"]].set_visible(False)
-    ax.grid(axis="y", color=theme.GRID_COLOR, linewidth=0.6, zorder=0)
-    ax.set_axisbelow(True)
+
+    brk = _outlier_break(vals)
+    if brk is None:
+        ax = fig.add_subplot(subplot_spec)
+        bars = ax.bar(cats, vals, color=color or theme.BLUE)
+        ax.bar_label(bars, labels=[fmt(v) for v in vals], fontsize=7, padding=1)
+        _add_headroom(ax, vals)
+        ax.tick_params(axis="x", labelsize=8)
+        _style_bar_axes(ax, is_percent)
+        return True
+
+    bottom_max, top_max = brk
+    ax_top, ax_bot = _make_broken_axes(fig, subplot_spec)
+    # Zero out each axis's copy of a bar that doesn't belong to its cluster
+    # (rather than drawing the real height everywhere and relying on ylim to
+    # clip the rest away) - clipping a real bar right at the axis boundary
+    # can leave a stray sliver of its top edge visible from anti-aliasing.
+    vals_top = [v if v > bottom_max else 0 for v in vals]
+    vals_bot = [v if v <= bottom_max else 0 for v in vals]
+    bars_top = ax_top.bar(cats, vals_top, color=color or theme.BLUE)
+    bars_bot = ax_bot.bar(cats, vals_bot, color=color or theme.BLUE)
+    ax_top.bar_label(bars_top, labels=[fmt(v) if v else "" for v in vals_top], fontsize=7, padding=1)
+    ax_bot.bar_label(bars_bot, labels=[fmt(v) if v else "" for v in vals_bot], fontsize=7, padding=1)
+    lo = min(0, min(vals))
+    _finish_broken_axes(ax_top, ax_bot, bottom_max, top_max, is_percent, lo=lo)
+    ax_bot.tick_params(axis="x", labelsize=8)
     return True
 
 
