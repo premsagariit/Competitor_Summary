@@ -2,23 +2,23 @@ Row-key alignment: 818 rows in mine, 818 in GT, 818 keys match, 0 of mine have n
 
 ===== SUMMARY =====
 GT rows with a value filled (denominator): 708
-  Correctly extracted & matching GT:        408
-  Filled but WRONG (mismatch vs GT):         252
-  GT has a value, we left blank (missed):    48
-We filled but GT is blank (extra/unverified): 64
-Both blank: 46
+  Correctly extracted & matching GT:        412
+  Filled but WRONG (mismatch vs GT):         262
+  GT has a value, we left blank (missed):    34
+We filled but GT is blank (extra/unverified): 62
+Both blank: 48
 
-Accuracy (correct / GT-filled): 57.6%
-Coverage (attempted / GT-filled): 93.2%
+Accuracy (correct / GT-filled): 58.2%
+Coverage (attempted / GT-filled): 95.2%
 
 ===== BY COMPANY =====
   ABHI: correct=42 wrong=32 missing=3 extra=8  (n=85)
   Galaxy Health: correct=38 wrong=28 missing=3 extra=16  (n=85)
-  Manipal Cigna: correct=40 wrong=34 missing=3 extra=8  (n=85)
+  Manipal Cigna: correct=40 wrong=34 missing=3 extra=7  (n=84)
   NBHI: correct=42 wrong=30 missing=2 extra=8  (n=82)
   Star Health: correct=48 wrong=24 missing=2 extra=8  (n=82)
   Care Health: correct=30 wrong=32 missing=11 extra=8  (n=81)
-  Narayana Health: correct=14 wrong=32 missing=21 extra=8  (n=75)
+  Narayana Health: correct=18 wrong=42 missing=7 extra=7  (n=74)
   GDPI by Channel - SAHI: correct=38 wrong=4 missing=0 extra=0  (n=42)
   Segment-wise GDPI mix - SAHI: correct=39 wrong=1 missing=0 extra=0  (n=40)
   Segment-wise GDPI mix: correct=5 wrong=15 missing=0 extra=0  (n=20)
@@ -92,14 +92,6 @@ Coverage (attempted / GT-filled): 93.2%
   slide9 Narayana Health / CAGR / SAHI CAGR: gt=(0,0)
   slide9 STAR / CAGR / SAHI CAGR: gt=(0.1287707853636224,0.2197655913951408)
   slide9 Narayana Health / SAHI Growth / GDPI Growth SAHI: gt=(3.1292758620689654,0)
-  slide17 Narayana Health / Uttar Pradesh / None: gt=(#VALUE!,#VALUE!)
-  slide17 Narayana Health / Maharashtra / None: gt=(None,#VALUE!)
-  slide17 Narayana Health / Karnataka / None: gt=(1,1)
-  slide17 Narayana Health / Haryana / None: gt=(#VALUE!,#VALUE!)
-  slide17 Narayana Health / Tamil Nadu / None: gt=(#VALUE!,#VALUE!)
-  slide17 Narayana Health / Kerala / None: gt=(#VALUE!,#VALUE!)
-  slide17 Narayana Health / Delhi / None: gt=(#VALUE!,None)
-  slide17 Narayana Health / Others / None: gt=(#VALUE!,#VALUE!)
   slide20 NBHI / Average Claim Size / None: gt=(30582.22175859363,33525.79063570013)
   slide20 Star Health / Average Claim Size / None: gt=(41846.31230478252,32197.19658992943)
   slide20 Care Health / Average Claim Size / None: gt=(29819.86580294346,32292.3379131632)
@@ -114,3 +106,11 @@ Coverage (attempted / GT-filled): 93.2%
   slide20 ABHI / No. of claims to No. of policies / None: gt=(0.8253111659491688,1.013167958804793)
   slide20 Narayana Health / No. of claims to No. of policies / None: gt=(0.3048042154840541,0.006896551724137931)
   slide20 Galaxy Health / No. of claims to No. of policies / None: gt=(0.01030164520284912,0.006622516556291391)
+  slide23 Narayana Health / Net Worth / None: gt=(8531.73,8977.630000000001)
+  slide25 Care Health / Sovereign / None: gt=(0.36,0.381)
+  slide25 Care Health / AAA rated / None: gt=(0.583,0.552)
+  slide25 Care Health / AA or better / None: gt=(0.058,0.066)
+  slide25 Care Health / Rated below AA but above A / None: gt=(-,-)
+  slide26 Care Health / Up to 1 year / Avg. Maturity (5.4 years): gt=(0.098,0.129)
+  slide26 Care Health / More than 1 year and upto 3 years / Avg. Maturity (4.8 years): gt=(0.165,0.161)
+  slide26 Care Health / More than 3 years and upto 7 years / Avg. Maturity (6.0 years): gt=(0.274,0.245)
