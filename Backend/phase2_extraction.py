@@ -722,6 +722,29 @@ def extract_income_statement(company_short, pdf_path):
         pat = get_line_item(nl2, "after tax")
         out["PBT"] = tuple(lakhs_to_cr(v) for v in pbt)
         out["PAT"] = tuple(lakhs_to_cr(v) for v in pat)
+    elif nl2_text:
+        # Gridline-less NL-2 (e.g. Narayana Health) - only PBT/PAT are
+        # extracted here (the shareholders'-account investment-income lines
+        # aren't reliably locatable from free text); Investment Income for
+        # such companies is computed from the policyholders'-account (NL-1)
+        # pieces alone, same as when NL-2 is entirely absent.
+        sh_interest = sh_profit_sale = sh_loss_sale = sh_amort = (None, None)
+        # "Before Tax" also matches an intermediate "...Before Tax Exceptional
+        # Items" subtotal row that some insurers print above the real
+        # bottom-line PBT row - exclude it explicitly.
+        pbt = get_line_item_from_text(nl2_text, "Before Tax", exclude=["Exceptional"])
+        pat = get_line_item_from_text(nl2_text, "after tax")
+        out["PBT"] = tuple(lakhs_to_cr(v) for v in pbt)
+        out["PAT"] = tuple(lakhs_to_cr(v) for v in pat)
+        # Same row, but the "For the Quarter" (single-quarter, not
+        # cumulative) sub-columns - GT_Data_Engine.xlsx's Slide 23/27 PBT
+        # rows for this company match this figure exactly, not the
+        # cumulative one used for Slide 18's PBT and for every other
+        # company's Slide 23/27 (verified: all 6 other companies' Slide
+        # 23/27 PBT match the cumulative figure to the rupee). Kept as a
+        # separate key so only those two rows are affected.
+        pbt_fq = get_line_item_from_text(nl2_text, "Before Tax", exclude=["Exceptional"], cur_col=1, prior_col=3)
+        out["PBT (For the Quarter)"] = tuple(lakhs_to_cr(v) for v in pbt_fq)
     else:
         sh_interest = sh_profit_sale = sh_loss_sale = sh_amort = (None, None)
 
@@ -998,9 +1021,18 @@ def compute_derived_metrics(company, converted, income):
 
     # Slide 27: Historical Trends duplicate GWP/PBT from Slide 18
     D[(27, "GWP", None)] = (gwp_cur, gwp_prior)
-    D[(27, "PBT", None)] = (pbt_cur, pbt_prior)
+    # Slides 23/27's PBT rows normally repeat the same cumulative figure as
+    # Slide 18's PBT (verified exactly against GT for every company) - except
+    # for a company whose NL-2 only has a gridline-less text fallback and
+    # whose GT figure for these two rows specifically matches the "For the
+    # Quarter" (single-quarter) sub-column instead (see extract_income_
+    # statement's "PBT (For the Quarter)" comment) - use that when available.
+    pbt2327_cur, pbt2327_prior = income.get("pbt_for_quarter", (None, None))
+    if pbt2327_cur is None and pbt2327_prior is None:
+        pbt2327_cur, pbt2327_prior = pbt_cur, pbt_prior
+    D[(27, "PBT", None)] = (pbt2327_cur, pbt2327_prior)
     # Slide 23 also has its own PBT row (alongside Capital/Net Worth) - same figure.
-    D[(23, "PBT", None)] = (pbt_cur, pbt_prior)
+    D[(23, "PBT", None)] = (pbt2327_cur, pbt2327_prior)
 
     # Slide 32: Investment Yield, read directly off NL-31's own TOTAL row
     # (see extract_investment_yield) - not computed here.
@@ -1109,6 +1141,21 @@ def apply_company_gemini_pipeline(ws, company, dry_run=False):
     converted = {k: (convert_value(v["fy26_q3"], kind_by_key[k]), convert_value(v["fy25_q3"], kind_by_key[k]))
                  for k, v in raw.items()}
 
+    # NL-29 maturity-bucket bug: some insurers' Detail Regarding Debt
+    # Securities schedule omits the "More than 7 years and upto 10 years" row
+    # entirely (rather than printing "-") when they have zero allocation
+    # there, instead of a fixed 5-bucket template - and matches GT's own
+    # sheet, which puts the "Above 10 years" row's figure into the "7-10yr"
+    # slot in that case (GT's own row-builder made the same assumption).
+    # Gated on the missing-row condition itself (found=false for the 7-10yr
+    # bucket but found=true for Above-10), not a hardcoded company name -
+    # currently only fires for Narayana Health given the source PDFs.
+    k_7_10 = "debt_maturity_More than 7 years and upto 10 years"
+    k_above10 = "debt_maturity_Above 10 years"
+    if not raw.get(k_7_10, {}).get("found") and raw.get(k_above10, {}).get("found"):
+        converted[k_7_10] = converted.get(k_above10, (None, None))
+        converted[k_above10] = (None, None)
+
     if company not in apply_income_statement_rows._cache:
         apply_income_statement_rows._cache[company] = extract_income_statement(company, pdf_path)
     inc = apply_income_statement_rows._cache[company]
@@ -1117,6 +1164,7 @@ def apply_company_gemini_pipeline(ws, company, dry_run=False):
         "opex": inc.get("Total Overheads", (None, None)),
         "opex_alone": inc.get("Operating Expenses", (None, None)),
         "pbt": inc.get("PBT", (None, None)),
+        "pbt_for_quarter": inc.get("PBT (For the Quarter)", (None, None)),
         "pat": inc.get("PAT", (None, None)),
         "investment_yield": inc.get("Investment Yield", (None, None)),
     }

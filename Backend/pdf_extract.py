@@ -69,11 +69,16 @@ def _header_events(table):
 
 def _col_for(events, row_idx, year_frag):
     """Most recent (row_idx' <= row_idx) header column whose text contains
-    year_frag; None if no such header precedes this row."""
+    year_frag; None if no such header precedes this row. year_frag may be a
+    single substring or a tuple/list of candidate substrings (tried as an OR)
+    - most insurers spell the full 4-digit year in their column headers, but
+    at least one (Narayana) prints dates as 'Up to the quarter 31-Dec-25', a
+    2-digit year with no 4-digit substring anywhere in the header text."""
+    frags = (year_frag,) if isinstance(year_frag, str) else tuple(year_frag)
     best = None
     best_ridx = None
     for ridx, col, text in events:
-        if ridx <= row_idx and year_frag in text:
+        if ridx <= row_idx and any(f in text for f in frags):
             best, best_ridx = col, ridx
     return best, best_ridx
 
@@ -190,15 +195,21 @@ def get_form_text(pdf_path, form_pattern, page_hint_range=None):
     return p["text"], p["page_number"] - 1
 
 
-def get_line_item_from_text(text, *label_substrings, cur_col=0, prior_col=2):
-    """Line-based fallback: find the line containing all label_substrings,
-    pull all numeric tokens from it, and return (cur_col, prior_col)-th ones.
-    Assumes the page's stated column order (verify against a header line
-    before relying on this for a new source PDF)."""
+def get_line_item_from_text(text, *label_substrings, cur_col=0, prior_col=2, exclude=None):
+    """Line-based fallback: find the line containing all label_substrings
+    (and none of `exclude`, for disambiguating e.g. a subtotal row like
+    "...Before Tax Exceptional Items" from the bottom-line "...Before Tax"
+    row it's a substring-superset of), pull all numeric tokens from it, and
+    return (cur_col, prior_col)-th ones. Assumes the page's stated column
+    order (verify against a header line before relying on this for a new
+    source PDF)."""
     if not text:
         return None, None
+    exclude = exclude or []
     for line in text.splitlines():
         low = line.lower()
+        if any(s.lower() in low for s in exclude):
+            continue
         if all(s.lower() in low for s in label_substrings):
             # drop the label text itself so it can't be mistaken for a number
             rest = line
@@ -206,6 +217,17 @@ def get_line_item_from_text(text, *label_substrings, cur_col=0, prior_col=2):
                 idx = rest.lower().find(s.lower())
                 if idx != -1:
                     rest = rest[idx + len(s):]
+            # Strip inline schedule references (e.g. "NL-5", "NL-6") before
+            # tokenizing - _NUM_TOKEN has no word-boundary requirement before
+            # "-", so "NL-5" would otherwise be misread as the number -5.
+            rest = re.sub(r"\bNL-\d+\b", "", rest, flags=re.IGNORECASE)
+            # Collapse a stray space right after "(" or before ")" (an
+            # occasional pdfplumber text-extraction artifact, e.g.
+            # "( 310.06)") - _NUM_TOKEN requires "(" immediately followed by
+            # a digit to recognize a negative/parenthesized number, so an
+            # un-collapsed gap here would silently drop the sign.
+            rest = re.sub(r"\(\s+", "(", rest)
+            rest = re.sub(r"\s+\)", ")", rest)
             tokens = _NUM_TOKEN.findall(rest)
             vals = [parse_num(t) for t in tokens]
             cur = vals[cur_col] if cur_col < len(vals) else None
@@ -214,7 +236,7 @@ def get_line_item_from_text(text, *label_substrings, cur_col=0, prior_col=2):
     return None, None
 
 
-def get_line_item_any(fp: FormPage, label_variants, cur_year_frag="2025", prior_year_frag="2024"):
+def get_line_item_any(fp: FormPage, label_variants, cur_year_frag=("2025", "-25"), prior_year_frag=("2024", "-24")):
     """Try each label variant (a list of substring-tuples) in turn - insurers
     don't all use the same wording for the same line item (e.g. 'Net Earned
     Premium' vs 'Total Premium Earned (Net)') - and return the first that
@@ -226,7 +248,7 @@ def get_line_item_any(fp: FormPage, label_variants, cur_year_frag="2025", prior_
     return None, None
 
 
-def get_line_item(fp: FormPage, *label_substrings, cur_year_frag="2025", prior_year_frag="2024"):
+def get_line_item(fp: FormPage, *label_substrings, cur_year_frag=("2025", "-25"), prior_year_frag=("2024", "-24")):
     """Find a labeled row (possibly appearing more than once, once per
     year-block) and return its (current, prior) cumulative 'Up to the
     quarter'/'Period ended' values."""
