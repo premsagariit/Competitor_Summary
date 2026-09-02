@@ -1,5 +1,8 @@
 Backend/myenv/
 Backend/.env
+Backend/cache/
+gemini_raw_dump.json
+Backend/gemini_raw_dump.json
 **/__pycache__/
 *.pyc
 ~$*.xlsx

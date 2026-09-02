@@ -13,26 +13,17 @@ free-text parsing of the model's answer.
 """
 import json
 import os
-import re
 
-import pdfplumber
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
+import pdf_cache
+from pdf_cache import COMPANY_PDFS, FORM_PATTERNS
+
 load_dotenv()
 
 MODEL = "gemini-flash-lite-latest"
-
-COMPANY_PDFS = {
-    "NBHI": "downloads/FY26/Q3/Niva_Bupa_Health_Insurance.pdf",
-    "ABHI": "downloads/FY26/Q3/Aditya_Birla_Health_Insurance.pdf",
-    "Care Health": "downloads/FY26/Q3/Care_Health_Insurance.pdf",
-    "Star Health": "downloads/FY26/Q3/Star_Health_and_Allied_Insurance.pdf",
-    "Manipal Cigna": "downloads/FY26/Q3/ManipalCigna_Health_Insurance.pdf",
-    "Narayana Health": "downloads/FY26/Q3/Narayana_Health_Insurance.pdf",
-    "Galaxy Health": "downloads/FY26/Q3/Galaxy_Health_Insurance.pdf",
-}
 
 _client = None
 
@@ -49,56 +40,25 @@ def client():
 # ---------------------------------------------------------------------------
 
 def build_company_payload(pdf_path, form_keys, max_pages_per_form=2):
-    """Single pass over the PDF: extract each page's text once, match it
-    against every requested form's pattern, then pull tables (or raw text as
-    a fallback for gridline-less pages) only for matched pages. Re-opening
-    the PDF and rescanning all pages once per form is far slower."""
-    patterns = {key: FORM_PATTERNS[key] for key in form_keys}
-    matches = {key: [] for key in form_keys}
-    with pdfplumber.open(pdf_path) as pdf:
-        page_texts = {}
-        for i, page in enumerate(pdf.pages):
-            text = page.extract_text() or ""
-            page_texts[i] = text
-            for key, (_, pattern) in patterns.items():
-                if len(matches[key]) < max_pages_per_form and re.search(pattern, text, re.IGNORECASE):
-                    matches[key].append(i)
-        payload = {}
-        for key, (form_name, _) in patterns.items():
-            pages_out = []
-            for i in matches[key]:
-                page = pdf.pages[i]
-                tables = page.extract_tables()
-                entry = {"page_index": i}
-                if tables:
-                    entry["tables"] = tables
-                else:
-                    entry["text"] = page_texts[i]
-                pages_out.append(entry)
-            payload[key] = {"form_name": form_name, "pages": pages_out}
+    """Sources pages from the on-disk PDF-JSON cache (pdf_cache.py) - the
+    cache itself does the one-pass pdfplumber scan (text + tables for every
+    page), persisted to disk so repeat calls/runs don't re-parse the PDF at
+    all. Same output shape as before: {form_key: {"form_name", "pages": [...]}}"""
+    doc = pdf_cache.get_company_json(pdf_path)
+    payload = {}
+    for key in form_keys:
+        form_name, _ = FORM_PATTERNS[key]
+        pages = pdf_cache.pages_for_form(doc, key, max_pages=max_pages_per_form)
+        pages_out = []
+        for p in pages:
+            entry = {"page_index": p["page_number"] - 1}
+            if p["tables"]:
+                entry["tables"] = p["tables"]
+            else:
+                entry["text"] = p["text"]
+            pages_out.append(entry)
+        payload[key] = {"form_name": form_name, "pages": pages_out}
     return payload
-
-
-# Forms needed across the Data Engine's company-level slides, keyed by the
-# short tag used in the sheet's "Source Tab" column.
-FORM_PATTERNS = {
-    "NL-1": ("Revenue Account (NL-1-B-RA)", r"FORM\s+NL-1-B-RA"),
-    "NL-2": ("Profit & Loss Account (NL-2-B-PL)", r"FORM\s+NL-2-B-PL"),
-    "NL-3": ("Balance Sheet (NL-3-B-BS)", r"FORM\s+NL-3-B-BS"),
-    "NL-4": ("Premium Schedule (NL-4)", r"FORM\s+NL-4"),
-    "NL-5": ("Claims Schedule (NL-5)", r"FORM\s+NL-5"),
-    "NL-6": ("Commission Schedule (NL-6)", r"FORM\s+NL-6"),
-    "NL-7": ("Operating Expenses Schedule (NL-7)", r"FORM\s+NL-7"),
-    "NL-12": ("Investment Schedule (NL-12 & 12A)", r"FORM\s+NL-12"),
-    "NL-20": ("Analytical Ratios Schedule (NL-20)", r"FORM\s+NL-20"),
-    "NL-29": ("Detail Regarding Debt Securities (NL-29)", r"FORM\s+NL-29"),
-    "NL-31": ("Statement of Investment and Income on Investment (NL-31)", r"FORM\s+NL-31"),
-    "NL-33": ("Reinsurance/Retrocession Risk Concentration (NL-33)", r"FORM\s+NL-33"),
-    "NL-34": ("Geographical Distribution of Business (NL-34)", r"FORM\s+NL-34"),
-    "NL-36": ("Business - Channels Wise (NL-36)", r"FORM\s+NL-36"),
-    "NL-37": ("Claims Data (NL-37)", r"FORM\s+NL-37"),
-    "NL-41": ("Offices Information (NL-41)", r"FORM\s+NL-41"),
-}
 
 
 # ---------------------------------------------------------------------------

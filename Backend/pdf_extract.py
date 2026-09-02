@@ -17,17 +17,9 @@ Two distinct table layouts show up across insurers for the same form:
 last appeared above it in reading order, which handles both cases uniformly.
 """
 import re
-import pdfplumber
 
-COMPANY_PDFS = {
-    "NBHI": "downloads/FY26/Q3/Niva_Bupa_Health_Insurance.pdf",
-    "ABHI": "downloads/FY26/Q3/Aditya_Birla_Health_Insurance.pdf",
-    "Care Health": "downloads/FY26/Q3/Care_Health_Insurance.pdf",
-    "Star Health": "downloads/FY26/Q3/Star_Health_and_Allied_Insurance.pdf",
-    "Manipal Cigna": "downloads/FY26/Q3/ManipalCigna_Health_Insurance.pdf",
-    "Narayana Health": "downloads/FY26/Q3/Narayana_Health_Insurance.pdf",
-    "Galaxy Health": "downloads/FY26/Q3/Galaxy_Health_Insurance.pdf",
-}
+import pdf_cache
+from pdf_cache import COMPANY_PDFS
 
 
 def parse_num(s):
@@ -165,24 +157,21 @@ class FormPage:
 
 def get_form_page(pdf_path, form_pattern, page_hint_range=None, all_matches=False):
     """Locate page(s) whose text matches `form_pattern` (regex) in the header,
-    return a FormPage built from that page's (or those pages') extracted tables.
-    """
-    with pdfplumber.open(pdf_path) as pdf:
-        pages_iter = enumerate(pdf.pages)
-        if page_hint_range:
-            pages_iter = [(i, pdf.pages[i]) for i in page_hint_range if i < len(pdf.pages)]
-        matched_tables = []
-        matched_idxs = []
-        for i, page in pages_iter:
-            text = page.extract_text() or ""
-            if re.search(form_pattern, text, re.IGNORECASE):
-                matched_tables.extend(page.extract_tables())
-                matched_idxs.append(i)
-                if not all_matches:
-                    break
-        if not matched_tables:
-            return None, []
-        return FormPage(matched_tables), matched_idxs
+    return a FormPage built from that page's (or those pages') extracted
+    tables. Sourced from the on-disk PDF-JSON cache (pdf_cache.py) rather than
+    re-opening/re-scanning the PDF."""
+    doc = pdf_cache.get_company_json(pdf_path)
+    pages = pdf_cache.pages_for_pattern(doc, form_pattern, page_hint_range=page_hint_range)
+    if not all_matches:
+        pages = pages[:1]
+    matched_tables = []
+    matched_idxs = []
+    for p in pages:
+        matched_tables.extend(p["tables"])
+        matched_idxs.append(p["page_number"] - 1)
+    if not matched_tables:
+        return None, []
+    return FormPage(matched_tables), matched_idxs
 
 
 _NUM_TOKEN = re.compile(r"\(?-?[\d,]+\.?\d*\)?|-(?=\s|$)")
@@ -191,16 +180,14 @@ _NUM_TOKEN = re.compile(r"\(?-?[\d,]+\.?\d*\)?|-(?=\s|$)")
 def get_form_text(pdf_path, form_pattern, page_hint_range=None):
     """Fallback for pages with no ruled gridlines (pdfplumber's table
     detection needs both horizontal & vertical lines) - returns raw
-    extract_text() for the first matching page instead of a FormPage."""
-    with pdfplumber.open(pdf_path) as pdf:
-        pages_iter = enumerate(pdf.pages)
-        if page_hint_range:
-            pages_iter = [(i, pdf.pages[i]) for i in page_hint_range if i < len(pdf.pages)]
-        for i, page in pages_iter:
-            text = page.extract_text() or ""
-            if re.search(form_pattern, text, re.IGNORECASE):
-                return text, i
-    return None, None
+    extract_text() for the first matching page instead of a FormPage.
+    Sourced from the on-disk PDF-JSON cache (pdf_cache.py)."""
+    doc = pdf_cache.get_company_json(pdf_path)
+    pages = pdf_cache.pages_for_pattern(doc, form_pattern, page_hint_range=page_hint_range)
+    if not pages:
+        return None, None
+    p = pages[0]
+    return p["text"], p["page_number"] - 1
 
 
 def get_line_item_from_text(text, *label_substrings, cur_col=0, prior_col=2):
