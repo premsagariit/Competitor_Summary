@@ -41,14 +41,6 @@ function metaFor(state, id) {
   );
 }
 
-// The per-company metric total is reported by the backend — it is the length
-// of the pipeline's own metric spec list, not a hardcoded catalogue that could
-// drift out of step with it.
-function metricsTotalFor(state) {
-  const first = Object.values(state.companies || {})[0];
-  return first?.extraction?.metricsTotal || 0;
-}
-
 function phaseTone(status) {
   return status === "done" ? "emerald" : status === "error" ? "rose" : status === "running" || status === "downloading" || status === "extracting" ? "brand" : "slate";
 }
@@ -58,8 +50,6 @@ function phaseTone(status) {
 // ---------------------------------------------------------------------------
 export function OverviewView({ state, onNavigate, onRun, onToggleCompany, onSelectAll, onSelectNone }) {
   const { phases, companies, activity, running, elapsed, reportProgress } = state;
-  const metricsTotal = Object.keys(companies).length * metricsTotalFor(state);
-  const metricsDone = Object.values(companies).reduce((a, c) => a + c.extraction.metricsDone, 0);
   const awaitingReview = state.runStatus === "awaiting_review";
 
   return (
@@ -101,47 +91,35 @@ export function OverviewView({ state, onNavigate, onRun, onToggleCompany, onSele
         <PhaseStepper phases={phases} activeKey={null} onSelect={onNavigate} />
       </Card>
 
-      <Card className="p-5">
-        <div className="flex items-center justify-between mb-3">
-          <h3 className="text-sm font-semibold text-white">Companies to include</h3>
-          <div className="flex gap-2">
-            <Button variant="ghost" className="!py-1 !px-2 text-xs" disabled={running} onClick={onSelectAll}>Select all</Button>
-            <Button variant="ghost" className="!py-1 !px-2 text-xs" disabled={running} onClick={onSelectNone}>Select none</Button>
-          </div>
-        </div>
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
-          {state.companyList.map((c) => (
-            <Checkbox
-              key={c.id}
-              checked={state.selectedCompanies.has(c.id)}
-              disabled={running}
-              onChange={() => onToggleCompany(c.id)}
-              label={c.short}
-            />
-          ))}
-        </div>
-      </Card>
-
-      <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
+      <div className="grid grid-cols-2 gap-4">
         <StatCard icon="building" label="Companies tracked" value={Object.keys(companies).length} tone="brand" />
-        <StatCard icon="cpu" label="Metrics extracted" value={`${metricsDone}/${metricsTotal}`} tone="violet" />
         <StatCard icon="fileText" label="Report progress" value={`${reportProgress}%`} tone="emerald" />
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
         <Card className="p-5 lg:col-span-3">
-          <h3 className="text-sm font-semibold text-white mb-4">Retrieval &amp; Extraction Snapshot</h3>
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-sm font-semibold text-white">Retrieval &amp; Extraction Snapshot</h3>
+            <div className="flex gap-2">
+              <Button variant="ghost" className="!py-1 !px-2 text-xs" disabled={running} onClick={onSelectAll}>Select all</Button>
+              <Button variant="ghost" className="!py-1 !px-2 text-xs" disabled={running} onClick={onSelectNone}>Select none</Button>
+            </div>
+          </div>
           <div className="flex flex-col gap-3">
             {Object.entries(companies).map(([id, c]) => {
               const company = metaFor(state, id);
               const isSelected = state.selectedCompanies.has(id);
               return (
                 <div key={id} className={`flex items-center gap-3 ${isSelected ? "" : "opacity-40"}`}>
+                  <Checkbox
+                    checked={isSelected}
+                    disabled={running}
+                    onChange={() => onToggleCompany(id)}
+                  />
                   <CompanyAvatar company={company} size={28} />
                   <div className="flex-1 min-w-0">
-                    <div className="flex items-center justify-between text-xs mb-1">
-                      <span className="text-slate-300 truncate">{company.short}{company.self && <span className="text-brand-400 ml-1">(you)</span>}</span>
-                      <span className="text-slate-500">{c.extraction.metricsDone}/{c.extraction.metricsTotal} metrics</span>
+                    <div className="text-xs text-slate-300 truncate mb-1">
+                      {company.short}{company.self && <span className="text-brand-400 ml-1">(you)</span>}
                     </div>
                     <ProgressBar value={c.retrieval.progress} tone={phaseTone(c.retrieval.status) === "rose" ? "rose" : "brand"} />
                   </div>
