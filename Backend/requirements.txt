@@ -1,0 +1,28 @@
+# Mirrors [project.dependencies] in pyproject.toml, which is the source of
+# truth (`pip install -e .` reads it directly). This file exists for tools
+# that expect a requirements.txt rather than a pyproject install.
+
+# Phase 1 - retrieval
+parallel-web
+httpx
+aiofiles
+python-dotenv
+
+# Phase 2 - extraction
+pdfplumber
+pypdf
+openpyxl
+google-genai
+
+# Phase 3 - reporting
+matplotlib
+
+# Phase 4 - dashboard
+streamlit
+
+# HTTP API consumed by the React dashboard
+fastapi
+uvicorn[standard]
+
+# Durable document storage (Cloudflare R2, S3-compatible)
+boto3

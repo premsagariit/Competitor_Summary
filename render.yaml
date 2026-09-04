@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: competitor-analysis-api
+    runtime: python
+    rootDir: Backend
+    buildCommand: pip install -e .
+    startCommand: uvicorn competitor_analysis.api.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: PARALLEL_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET_NAME
+        sync: false
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false

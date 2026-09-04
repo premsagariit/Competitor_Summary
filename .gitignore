@@ -1,9 +1,43 @@
 Backend/myenv/
+Backend/.venv/
 Backend/.env
-Backend/cache/
+.env
+
+# Generated artifacts: everything under artifacts/ is reproducible from
+# data/ by re-running the pipeline. The published PDF reports are committed;
+# the cache and dated workbook snapshots are not.
+Backend/artifacts/cache/
+Backend/artifacts/output/Data_Engine_*.xlsx
+
+# Retrieved regulatory filings: durable storage is now Cloudflare R2
+# (competitor_analysis.storage.r2), synced automatically by the pipeline -
+# not the repo, to keep it from growing every quarter.
+Backend/data/downloads/
+
+# Local run logs
+Backend/uvicorn.out.log
+Backend/uvicorn.err.log
+*.log
+
 gemini_raw_dump.json
-Backend/gemini_raw_dump.json
 **/__pycache__/
 *.pyc
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Excel lock files
 ~$*.xlsx
+
+# Personal Claude Code permission grants - machine-specific, not shared.
+.claude/settings.local.json
 .claude/scheduled_tasks.lock
+
+# Frontend (Vite/Node)
+Frontend/node_modules/
+Frontend/dist/
+
+# OS junk
+.DS_Store
+Thumbs.db
