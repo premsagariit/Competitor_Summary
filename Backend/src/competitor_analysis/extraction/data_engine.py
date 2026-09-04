@@ -38,6 +38,14 @@ from competitor_analysis import paths
 XLSX_PATH = str(paths.DATA_ENGINE_WORKBOOK)
 GIC_PATH = cfg.gic_path()
 
+# pdfplumber (pdfminer.six underneath) holds a full page/character object
+# graph in memory per open document, and prefetch_income_statements() parses
+# every company's PDF concurrently - so peak memory scales with this number,
+# not with PDF size alone. 7 (one thread per company) is fine on a dev
+# machine but reliably OOMs a 512MB container; keep the default modest and
+# let a memory-constrained deployment override it.
+PDF_PARSE_MAX_WORKERS = int(os.getenv("PDF_PARSE_MAX_WORKERS", "3"))
+
 # The two value-column headers follow the configured reporting period, so a
 # FY26-27 Q1 run labels its columns FY26-27_Q1/FY25-26_Q1 rather than carrying
 # FY25-26 Q3's labels. CUR/PRIOR are stable aliases for the same two columns:
@@ -1256,7 +1264,7 @@ def compute_derived_metrics(company, converted, income):
     return D
 
 
-def prefetch_income_statements(companies, max_workers=7):
+def prefetch_income_statements(companies, max_workers=PDF_PARSE_MAX_WORKERS):
     """Stage 2's per-company PDF extraction, run concurrently.
 
     Independent per company and I/O/CPU-bound in pdfplumber, so a thread pool
