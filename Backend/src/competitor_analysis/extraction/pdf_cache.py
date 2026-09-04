@@ -56,7 +56,9 @@ FORM_PATTERNS = {
     "NL-1": ("Revenue Account (NL-1-B-RA)", r"FORM\s+NL-1-B-RA"),
     "NL-2": ("Profit & Loss Account (NL-2-B-PL)", r"FORM\s+NL-2-B-PL"),
     "NL-3": ("Balance Sheet (NL-3-B-BS)", r"FORM\s+NL-3-B-BS"),
-    "NL-4": ("Premium Schedule (NL-4)", r"FORM\s+NL-4"),
+    # (?!\d) - not \b - stops this matching "FORM NL-41" while still matching
+    # "FORM NL-12A" for NL-12's own pattern below (see KNOWN_ISSUES.md #1).
+    "NL-4": ("Premium Schedule (NL-4)", r"FORM\s+NL-4(?!\d)"),
     "NL-5": ("Claims Schedule (NL-5)", r"FORM\s+NL-5"),
     "NL-6": ("Commission Schedule (NL-6)", r"FORM\s+NL-6"),
     "NL-7": ("Operating Expenses Schedule (NL-7)", r"FORM\s+NL-7"),
