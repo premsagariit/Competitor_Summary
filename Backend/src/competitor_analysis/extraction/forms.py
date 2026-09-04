@@ -163,6 +163,70 @@ def classify_period_columns(table, cur_year_frag=None, prior_year_frag=None):
     return events
 
 
+def _is_decorative_row(row):
+    """A row with at most one non-empty, non-'-' cell is a page-wide
+    caption/title/section-divider (spanning the table only because a
+    downstream forward-fill would spread its one real cell across every
+    column) rather than a per-column header - e.g. a form's title line, or a
+    bare section label like "STATES" with nothing else in the row. It
+    carries no per-column information, so it must be dropped before either
+    column classifier sees the table: left in, it forward-fills as a single
+    spurious "header" spanning every column, indistinguishable from a
+    genuine one."""
+    real = [c for c in row if c and str(c).strip() not in ("", "-")]
+    return len(real) <= 1 and len(row) > 2
+
+
+def strip_decorative_rows(table):
+    """Drop decorative rows (see _is_decorative_row) before classifying a
+    table with classify_period_columns() and/or classify_group_columns().
+    Returns a new table; row indices in classifier output are relative to
+    THIS returned table, not the original."""
+    return [row for row in table if not _is_decorative_row(row)]
+
+
+def classify_group_columns(table):
+    """For a pdfplumber-extracted table, classify every column by which
+    named GROUP/CATEGORY it belongs to - a line-of-business breakdown
+    (Health / Personal Accident / Travel / Total, NL-34), a fund breakdown
+    (Shareholders / Policyholders / Total, NL-12), a premium-vs-policy-count
+    breakdown (NL-36) - any header text that is NOT itself a period phrase.
+    This is the second axis classify_period_columns doesn't cover: a caller
+    composes the two (period x group) to identify one specific column in a
+    multi-category table, e.g. NL-34's "Total" segment's cumulative column,
+    not Health's or Personal Accident's.
+
+    Returns a list of {"row": row_idx, "col": col_idx, "label": text,
+    "forward_filled": bool}, one entry per header cell that is NOT a period/
+    quarter/snapshot header (a cell is classified by exactly one of
+    classify_period_columns or this function, never both). Forward-fills
+    merged header cells exactly as classify_period_columns does (a literal
+    "-" is never forward-filled itself, nor does it become the fill value
+    for a later None).
+
+    Callers should run this against a table that has already had decorative
+    rows stripped (strip_decorative_rows) - a page-wide title row would
+    otherwise surface here as a spurious group label spanning every column,
+    exactly as it would for the period axis.
+    """
+    events = []
+    for ridx, row in enumerate(table):
+        last = None
+        for cidx, cell in enumerate(row):
+            forward_filled = cell is None
+            if forward_filled:
+                cell = last
+            elif cell and str(cell).strip() != "-":
+                last = cell
+            if not cell:
+                continue
+            text = " ".join(str(cell).split())
+            if _is_cumulative_header(text) or _PERIOD_PHRASE_RE.search(text) or _SNAPSHOT_PHRASE_RE.search(text):
+                continue
+            events.append({"row": ridx, "col": cidx, "label": text, "forward_filled": forward_filled})
+    return events
+
+
 def _header_events(table):
     """[(row_idx, col_idx, text), ...] sorted by row_idx, for every
     cumulative-column header cell found anywhere in the table.
