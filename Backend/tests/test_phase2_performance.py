@@ -368,6 +368,53 @@ def test_non_quota_errors_are_not_retried(monkeypatch):
     assert len(attempts) == 1, "a non-quota error should fail fast"
 
 
+def test_validation_failure_is_retried_once_then_succeeds(monkeypatch):
+    """A malformed key (schemas.ExtractedValue validation failure) must be
+    retried like a 429 - but via the SAME retry loop, not a second call
+    shape: the retry re-sends the whole batch, not a single-metric call."""
+    attempts = []
+
+    def flaky(company, payload, metric_specs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise g.MetricValidationError(partial_out={}, invalid_keys=["m0"])
+        return {m["key"]: {"found": True, "fy26_q3": 1.0, "fy25_q3": 1.0,
+                           "source_form": None, "page_number": None,
+                           "evidence": None, "notes": None}
+                for m in metric_specs}
+
+    monkeypatch.setattr(g, "extract_metrics_via_gemini", flaky)
+    limiter = g.RateLimiter(rpm=0)
+    out = asyncio.run(g._call_with_retry("ACME", PAYLOAD, SPECS[:2], limiter))
+    assert len(attempts) == 2
+    assert out["m0"]["found"] is True, "the retry's real answer, not a placeholder"
+
+
+def test_validation_failure_isolates_to_one_key_after_final_retry(monkeypatch):
+    """Unlike an exhausted 429 (which loses the whole batch), a metric still
+    invalid after the retry is marked unresolved on its own - its batch
+    siblings that DID validate must survive, not be discarded with it."""
+    attempts = []
+
+    def always_bad(company, payload, metric_specs):
+        attempts.append(1)
+        raise g.MetricValidationError(
+            partial_out={"m1": {"found": True, "fy26_q3": 5.0, "fy25_q3": 4.0,
+                                "source_form": "NL-1", "page_number": 2,
+                                "evidence": "e", "notes": None}},
+            invalid_keys=["m0"],
+        )
+
+    monkeypatch.setattr(g, "extract_metrics_via_gemini", always_bad)
+    limiter = g.RateLimiter(rpm=0)
+    out = asyncio.run(g._call_with_retry("ACME", PAYLOAD, SPECS[:2], limiter))
+    assert len(attempts) == 2, "one initial attempt plus exactly one retry"
+    assert out["m1"]["found"] is True, "the batch's valid sibling must survive"
+    assert out["m0"] == {"fy26_q3": None, "fy25_q3": None, "found": False,
+                         "source_form": None, "page_number": None,
+                         "evidence": None, "notes": "validation failed after retry"}
+
+
 def test_cached_calls_do_not_consume_quota(monkeypatch):
     """A fully-cached run must not wait on the per-minute limiter - gating
     before the cache lookup made cached runs as slow as live ones."""

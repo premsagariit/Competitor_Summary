@@ -23,10 +23,14 @@ import os
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from pydantic import ValidationError
 
 from competitor_analysis.extraction import pdf_cache
 from competitor_analysis import config as cfg
 from competitor_analysis.extraction.pdf_cache import COMPANY_PDFS, FORM_PATTERNS
+from competitor_analysis.extraction.schemas import (
+    ExtractedValue, CHANNELS_36, DEBT_RATINGS, MATURITY_BUCKETS, STATES, INTERMEDIARIES,
+)
 from competitor_analysis import paths
 
 # Closing day of each quarter-end month, for phrasing the reporting period in
@@ -122,17 +126,6 @@ def build_company_payload(pdf_path, form_keys, max_pages_per_form=2):
 ALL_FORMS = ["NL-1", "NL-2", "NL-3", "NL-4", "NL-6", "NL-7", "NL-12", "NL-20",
              "NL-29", "NL-33", "NL-34", "NL-36", "NL-37", "NL-41"]
 
-CHANNELS_36 = [
-    ("Individual Agents", "Individual Agents"),
-    ("Corporate Agents - Banks", "Corporate Agents - Banks"),
-    ("Corporate Agents - Others", "Corporate Agents - Others"),
-    ("Brokers", "Brokers"),
-    ("Direct Business", "Direct Business"),
-    ("Common Service Centers / CSC", "CSC"),
-    ("Insurance Marketing Firm / IMF", "IMF"),
-    ("Web Aggregators", "Web Aggregator"),
-    ("Point of Sales person / POS", "POS"),
-]
 # Slide 13's channel labels use no space around the hyphen and drop "Direct
 # Business" - map CHANNELS_36's metric2 -> slide13's exact metric2 text.
 SLIDE13_METRIC2 = {
@@ -154,24 +147,6 @@ SLIDE12_COMPANY_METRIC1 = {
 }
 
 REGIONS = ["North", "East", "West", "Central", "South"]
-STATES = ["Uttar Pradesh", "Maharashtra", "Karnataka", "Haryana", "Tamil Nadu", "Kerala", "Delhi", "Others"]
-DEBT_RATINGS = [
-    ("Sovereign", "Any other (Sovereign)"), ("AAA rated", "AAA rated"),
-    ("AA or better", "AA or better"),
-    ("Rated below AA but above A", "Rated below AA but above A"),
-    ("Rated below A", "Rated below A but above B / Rated Below B combined"),
-]
-MATURITY_BUCKETS = [
-    "Up to 1 year", "More than 1 year and upto 3 years",
-    "More than 3 years and upto 7 years", "More than 7 years and upto 10 years",
-    "Above 10 years",
-]
-INTERMEDIARIES = [
-    ("Individual Agents", "Individual Agents"), ("Corporate Agents-Banks", "CA-Banks"),
-    ("Corporate Agents-Others", "CA-Others"), ("Insurance Brokers", "Brokers"),
-    ("Web Aggregators", "WA"), ("Insurance Marketing Firm", "IMF"),
-    ("Point of Sales persons", "POS"),
-]
 
 
 def master_metric_specs():
@@ -304,26 +279,33 @@ def master_metric_specs():
 # Step 2: JSON -> Gemini -> structured metrics
 # ---------------------------------------------------------------------------
 
+# Hand-shaped (type-array-nullable, no $ref/$defs) rather than emitted from
+# ExtractedValue.model_json_schema() directly - Pydantic's own schema output
+# uses anyOf for Optional fields, an untested shape against Gemini's
+# response_json_schema, whereas this exact literal fragment is already
+# proven to work in production. Its property set is asserted against
+# ExtractedValue's own fields/aliases in test_schemas_alignment.py, so the
+# two can't silently drift apart despite being independent definitions.
+_VALUE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "fy26_q3_value": {"type": ["number", "null"]},
+        "fy25_q3_value": {"type": ["number", "null"]},
+        "found": {"type": "boolean"},
+        "source_form": {"type": ["string", "null"]},
+        "page_number": {"type": ["integer", "null"]},
+        "evidence": {"type": ["string", "null"]},
+        "notes": {"type": ["string", "null"]},
+    },
+    "required": ["fy26_q3_value", "fy25_q3_value", "found",
+                 "source_form", "page_number", "evidence", "notes"],
+}
+
+
 def build_schema(metric_keys):
-    props = {}
-    for k in metric_keys:
-        props[k] = {
-            "type": "object",
-            "properties": {
-                "fy26_q3_value": {"type": ["number", "null"]},
-                "fy25_q3_value": {"type": ["number", "null"]},
-                "found": {"type": "boolean"},
-                "source_form": {"type": ["string", "null"]},
-                "page_number": {"type": ["integer", "null"]},
-                "evidence": {"type": ["string", "null"]},
-                "notes": {"type": ["string", "null"]},
-            },
-            "required": ["fy26_q3_value", "fy25_q3_value", "found",
-                         "source_form", "page_number", "evidence", "notes"],
-        }
     return {
         "type": "object",
-        "properties": props,
+        "properties": {k: _VALUE_SCHEMA for k in metric_keys},
         "required": metric_keys,
     }
 
@@ -402,14 +384,33 @@ def extract_metrics_via_gemini(company, payload, metric_specs):
         path = _cache_path(_cache_key(company, payload, metric_specs))
         CACHE_STATS["miss"] += 1
         out = _extract_metrics_via_gemini_uncached(company, payload, metric_specs)
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(out, f, indent=1)
-        except OSError as e:
-            print(f"  ! Could not write Gemini cache entry: {e}")
+        _write_cache_entry(path, out)
         return out
     CACHE_STATS["miss"] += 1
     return _extract_metrics_via_gemini_uncached(company, payload, metric_specs)
+
+
+def _write_cache_entry(path, out):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=1)
+    except OSError as e:
+        print(f"  ! Could not write Gemini cache entry: {e}")
+
+
+class MetricValidationError(Exception):
+    """One or more keys in a Gemini response failed ExtractedValue's
+    validation (e.g. found=True with a null current value) - malformed
+    structured output, not a business fact. Carries the keys that DID
+    validate so a caller doesn't have to re-derive them: _call_with_retry
+    retries the whole batch once on this, and if the same key(s) are still
+    invalid on the last attempt, degrades gracefully using partial_out
+    instead of losing every other metric in the batch too."""
+
+    def __init__(self, partial_out, invalid_keys):
+        super().__init__(f"validation failed for metric key(s): {', '.join(invalid_keys)}")
+        self.partial_out = partial_out
+        self.invalid_keys = invalid_keys
 
 
 def _extract_metrics_via_gemini_uncached(company, payload, metric_specs):
@@ -417,7 +418,10 @@ def _extract_metrics_via_gemini_uncached(company, payload, metric_specs):
     {key: {"fy26_q3": float|None, "fy25_q3": float|None, "found": bool,
     "source_form": str|None, "page_number": int|None, "evidence": str|None,
     "notes": str|None}} - the last four are an audit trail (which form/page/
-    row the value was read from), not used in any downstream computation."""
+    row the value was read from), not used in any downstream computation.
+
+    Raises MetricValidationError if any key's response fails ExtractedValue's
+    validation (see schemas.py) - never silently accepts a malformed value."""
     metric_keys = [m["key"] for m in metric_specs]
     metric_list = "\n".join(f"- {m['key']}: {m['description']}" for m in metric_specs)
     tables_json = json.dumps(payload, ensure_ascii=False, default=str)
@@ -445,17 +449,24 @@ def _extract_metrics_via_gemini_uncached(company, payload, metric_specs):
     )
     result = json.loads(resp.text)
     out = {}
+    invalid_keys = []
     for k in metric_keys:
-        v = result.get(k, {})
+        try:
+            ev = ExtractedValue.model_validate(result.get(k, {}))
+        except ValidationError:
+            invalid_keys.append(k)
+            continue
         out[k] = {
-            "fy26_q3": v.get("fy26_q3_value"),
-            "fy25_q3": v.get("fy25_q3_value"),
-            "found": v.get("found", False),
-            "source_form": v.get("source_form"),
-            "page_number": v.get("page_number"),
-            "evidence": v.get("evidence"),
-            "notes": v.get("notes"),
+            "fy26_q3": ev.current,
+            "fy25_q3": ev.prior,
+            "found": ev.found,
+            "source_form": ev.source_form,
+            "page_number": ev.page_number,
+            "evidence": ev.evidence,
+            "notes": ev.notes,
         }
+    if invalid_keys:
+        raise MetricValidationError(out, invalid_keys)
     return out
 
 
@@ -518,6 +529,32 @@ async def _call_with_retry(company, payload, batch, limiter, max_attempts=5):
         try:
             return await asyncio.to_thread(
                 extract_metrics_via_gemini, company, payload, batch)
+        except MetricValidationError as e:
+            # Exactly ONE retry, independent of max_attempts (that budget is
+            # sized for a 429/quota condition, which can genuinely clear
+            # given enough tries - a temperature=0 call repeating the exact
+            # same malformed answer 4 more times would just waste quota).
+            if attempt == 0:
+                print(f"  . {company}: {len(e.invalid_keys)} metric(s) failed validation, "
+                      f"retrying once: {', '.join(e.invalid_keys)}")
+                continue  # not a quota condition - no backoff delay needed
+            # Still invalid after that one retry: unlike an exhausted 429 (a
+            # transient/quota condition where retrying harder might have
+            # helped, so losing the whole batch is the honest outcome),
+            # resending an identical temperature=0 request is unlikely to
+            # change the model's answer - isolate the failure to just the
+            # offending key(s) instead of discarding every valid sibling
+            # metric in the batch too.
+            print(f"  ! {company}: {len(e.invalid_keys)} metric(s) still invalid after retry, "
+                  f"marking unresolved: {', '.join(e.invalid_keys)}")
+            out = dict(e.partial_out)
+            for k in e.invalid_keys:
+                out[k] = {"fy26_q3": None, "fy25_q3": None, "found": False,
+                          "source_form": None, "page_number": None,
+                          "evidence": None, "notes": "validation failed after retry"}
+            if USE_GEMINI_CACHE:
+                _write_cache_entry(_cache_path(_cache_key(company, payload, batch)), out)
+            return out
         except Exception as e:
             if not _is_rate_limit(e) or attempt == max_attempts - 1:
                 raise

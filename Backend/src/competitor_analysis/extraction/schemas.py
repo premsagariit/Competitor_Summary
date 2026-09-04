@@ -8,44 +8,80 @@ these models give it a typed, validated shape instead of the ad-hoc JSON-schema
 dict `gemini.build_schema()` builds today.
 
 The templated forms (NL-6, NL-29, NL-34, NL-36, NL-41's intermediary rows) are
-built with `create_model()` directly off the SAME label lists
+built with `create_model()` directly off the label lists below
 (`CHANNELS_36`, `DEBT_RATINGS`, `MATURITY_BUCKETS`, `STATES`, `INTERMEDIARIES`)
-`master_metric_specs()` itself loops over - not a hand-copied duplicate of
-them - so the field set can't silently drift out of sync with the registry.
+- these live HERE, not in gemini.py, and gemini.py imports them from this
+module (gemini.py already needs ExtractedValue for the wiring below, and
+schemas.py can't import back from a module that imports it). This makes
+schemas.py the canonical source `master_metric_specs()` itself loops over,
+rather than a duplicate of lists defined there - so the field set can't
+silently drift out of sync with the registry either way.
+
 Each field's alias is the exact metric key `master_metric_specs()` produces
 (e.g. "commission_ch_Corporate Agents - Banks"); the Python attribute name is
 a sanitized, valid-identifier form of the same label for downstream code to
 use. `populate_by_name=True` lets a model be built from either.
 
-Not wired into gemini.py yet - this is groundwork only (see forms.py/
-table_markdown.py commits for the same incremental approach applied to the
-Stage 1 side of this refactor).
+Wired into gemini.py's extraction call (build_schema/_extract_metrics_via_
+gemini_uncached/_call_with_retry) - see that module for the batching and
+retry-on-validation-failure design.
 """
 import re
 
 from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
 
-from competitor_analysis.extraction.gemini import (
-    CHANNELS_36, DEBT_RATINGS, MATURITY_BUCKETS, STATES, INTERMEDIARIES,
-)
-
 _CONFIG = ConfigDict(populate_by_name=True, extra="forbid")
+
+CHANNELS_36 = [
+    ("Individual Agents", "Individual Agents"),
+    ("Corporate Agents - Banks", "Corporate Agents - Banks"),
+    ("Corporate Agents - Others", "Corporate Agents - Others"),
+    ("Brokers", "Brokers"),
+    ("Direct Business", "Direct Business"),
+    ("Common Service Centers / CSC", "CSC"),
+    ("Insurance Marketing Firm / IMF", "IMF"),
+    ("Web Aggregators", "Web Aggregator"),
+    ("Point of Sales person / POS", "POS"),
+]
+STATES = ["Uttar Pradesh", "Maharashtra", "Karnataka", "Haryana", "Tamil Nadu", "Kerala", "Delhi", "Others"]
+DEBT_RATINGS = [
+    ("Sovereign", "Any other (Sovereign)"), ("AAA rated", "AAA rated"),
+    ("AA or better", "AA or better"),
+    ("Rated below AA but above A", "Rated below AA but above A"),
+    ("Rated below A", "Rated below A but above B / Rated Below B combined"),
+]
+MATURITY_BUCKETS = [
+    "Up to 1 year", "More than 1 year and upto 3 years",
+    "More than 3 years and upto 7 years", "More than 7 years and upto 10 years",
+    "Above 10 years",
+]
+INTERMEDIARIES = [
+    ("Individual Agents", "Individual Agents"), ("Corporate Agents-Banks", "CA-Banks"),
+    ("Corporate Agents-Others", "CA-Others"), ("Insurance Brokers", "Brokers"),
+    ("Web Aggregators", "WA"), ("Insurance Marketing Firm", "IMF"),
+    ("Point of Sales persons", "POS"),
+]
 
 
 class ExtractedValue(BaseModel):
     """One leaf metric's extraction result, mirroring the audit-trail shape
     `gemini._extract_metrics_via_gemini_uncached` already returns per key.
 
-    `current`/`prior` replace the existing dict's period-literal
-    `fy26_q3`/`fy25_q3` names - the pipeline already supports arbitrary
-    FY/quarter via `config.set_period()`, so a period-agnostic name here
-    avoids baking one hard-coded quarter into a schema meant to outlive it.
+    `current`/`prior` are the period-agnostic Python names - the pipeline
+    already supports arbitrary FY/quarter via `config.set_period()`, so
+    downstream code (derived metrics, mapping) shouldn't read a hard-coded
+    quarter off an attribute name. On the wire they keep their existing
+    `fy26_q3_value`/`fy25_q3_value` aliases: `gemini.PROMPT_TEMPLATE`'s prose
+    instructs the model using those exact literal names, and data_engine.py
+    reads the resulting dict's `fy26_q3`/`fy25_q3` keys - changing either
+    without touching that Stage-2 code (out of scope here) would silently
+    break both.
     """
     model_config = _CONFIG
 
     found: bool
-    current: float | None = None
-    prior: float | None = None
+    current: float | None = Field(default=None, alias="fy26_q3_value")
+    prior: float | None = Field(default=None, alias="fy25_q3_value")
     source_form: str | None = None
     page_number: int | None = None
     evidence: str | None = None
