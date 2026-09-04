@@ -18,6 +18,7 @@ dependencies = [
     "pypdf",
     "openpyxl",
     "google-genai",
+    "pydantic",
     # Phase 3 - reporting
     "matplotlib",
     # Phase 4 - dashboard
