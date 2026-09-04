@@ -32,6 +32,7 @@ from competitor_analysis.extraction.forms import (COMPANY_PDFS, get_form_page, g
                           extract_nl36 as pdf_extract_nl36, NL36_CHANNELS,
                           RESOLUTION_LOG, year_frags as pdf_extract_year_frags)
 from competitor_analysis.extraction import gemini as gemini_extract
+from competitor_analysis.extraction import schemas
 from competitor_analysis import config as cfg
 from competitor_analysis import paths
 
@@ -1070,15 +1071,34 @@ def apply_metric_to_rows(ws, idx, slide, company, metric1, metric2, cur, prior, 
     return written
 
 
-def compute_derived_metrics(company, converted, income):
-    """converted: {gemini_key: (cur, prior)} (already unit-converted).
+def _converted_value(regrouped, kind_by_key, key):
+    """(cur, prior) for one metric key, unit-converted exactly as the flat
+    dict path always has - the only thing that changed is reading the raw
+    figure off a typed schemas.FORM_SCHEMAS field instead of a dict lookup."""
+    form, field = schemas.KEY_TO_FIELD[key]
+    ev = getattr(regrouped[form], field)
+    kind = kind_by_key[key]
+    return (convert_value(ev.current, kind), convert_value(ev.prior, kind))
+
+
+def compute_derived_metrics(company, regrouped, kind_by_key, income):
+    """regrouped: {form_tag: schemas.FORM_SCHEMAS[form_tag] instance} from
+    schemas.regroup_by_form() - one validated Pydantic object per in-scope
+    NL-form. kind_by_key: {gemini_key: kind}, from master_metric_specs() -
+    still needed here since a field's unit isn't recoverable from the
+    Pydantic model alone.
     income: {"gwp":(cur,prior), "opex":(cur,prior), "pbt":(cur,prior), "pat":(cur,prior)} in Crores, from the deterministic Slide-18 extractor.
     Returns {(slide, metric1, metric2): (cur, prior)}.
+
+    The formulas below are unchanged from the pre-schemas version - only
+    get()'s own body changed (dict lookup -> typed attribute read); every
+    call site downstream still just calls get(key) and gets back the same
+    (cur, prior) tuple in the same units as before.
     """
     D = {}
 
     def get(key):
-        return converted.get(key, (None, None))
+        return _converted_value(regrouped, kind_by_key, key)
 
     def safe_div(a, b):
         if a is None or b is None or b == 0:
@@ -1317,8 +1337,6 @@ def apply_company_gemini_pipeline(ws, company, dry_run=False):
 
     kind_by_key = {m["key"]: m["kind"] for m in specs}
     rows_by_key = {m["key"]: m["rows"] for m in specs}
-    converted = {k: (convert_value(v["fy26_q3"], kind_by_key[k]), convert_value(v["fy25_q3"], kind_by_key[k]))
-                 for k, v in raw.items()}
 
     # NL-29 maturity-bucket bug: some insurers' Detail Regarding Debt
     # Securities schedule omits the "More than 7 years and upto 10 years" row
@@ -1329,11 +1347,17 @@ def apply_company_gemini_pipeline(ws, company, dry_run=False):
     # Gated on the missing-row condition itself (found=false for the 7-10yr
     # bucket but found=true for Above-10), not a hardcoded company name -
     # currently only fires for Narayana Health given the source PDFs.
+    # Applied to a COPY of raw, not raw itself: write_extraction_audit below
+    # must still see the model's original, unshimmed answer.
+    raw_for_derivation = dict(raw)
     k_7_10 = "debt_maturity_More than 7 years and upto 10 years"
     k_above10 = "debt_maturity_Above 10 years"
     if not raw.get(k_7_10, {}).get("found") and raw.get(k_above10, {}).get("found"):
-        converted[k_7_10] = converted.get(k_above10, (None, None))
-        converted[k_above10] = (None, None)
+        raw_for_derivation[k_7_10] = raw[k_above10]
+        raw_for_derivation[k_above10] = {"fy26_q3": None, "fy25_q3": None, "found": False,
+                                         "source_form": None, "page_number": None,
+                                         "evidence": None, "notes": None}
+    regrouped = schemas.regroup_by_form(raw_for_derivation, specs)
 
     if company not in apply_income_statement_rows._cache:
         apply_income_statement_rows._cache[company] = extract_income_statement(company, pdf_path)
@@ -1353,11 +1377,11 @@ def apply_company_gemini_pipeline(ws, company, dry_run=False):
     written = 0
 
     for key, rows in rows_by_key.items():
-        cur, prior = converted.get(key, (None, None))
+        cur, prior = _converted_value(regrouped, kind_by_key, key)
         for (slide, metric1, metric2) in rows:
             written += apply_metric_to_rows(ws, idx, slide, company, metric1, metric2, cur, prior, dry_run, log)
 
-    derived = compute_derived_metrics(company, converted, income)
+    derived = compute_derived_metrics(company, regrouped, kind_by_key, income)
     for (slide, metric1, metric2), (cur, prior) in derived.items():
         if metric1.startswith("__SLIDE12__"):
             actual_metric1 = metric1[len("__SLIDE12__"):]

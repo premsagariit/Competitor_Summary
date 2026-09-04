@@ -25,7 +25,13 @@ use. `populate_by_name=True` lets a model be built from either.
 Wired into gemini.py's extraction call (build_schema/_extract_metrics_via_
 gemini_uncached/_call_with_retry) - see that module for the batching and
 retry-on-validation-failure design.
+
+regroup_by_form()/KEY_TO_FIELD wire this into data_engine.py's derived-metrics
+and row-mapping layers: they turn the flat per-key dict
+extract_company_metrics_async() returns back into one validated FORM_SCHEMAS
+instance per form, and back-map a metric key to (form, python field name).
 """
+import collections
 import re
 
 from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
@@ -232,3 +238,40 @@ FORM_SCHEMAS = {
     "NL-29": NL29, "NL-33": NL33, "NL-34": NL34, "NL-36": NL36,
     "NL-37": NL37, "NL-41": NL41,
 }
+
+# metric key -> (form, python field name), e.g. "commission_ch_Corporate
+# Agents - Banks" -> ("NL-6", "commission_ch_corporate_agents_banks"). Built
+# from FORM_SCHEMAS itself, not hand-copied, so it can't drift from it either.
+KEY_TO_FIELD = {
+    f.alias or name: (form, name)
+    for form, model in FORM_SCHEMAS.items()
+    for name, f in model.model_fields.items()
+}
+
+
+def regroup_by_form(raw, specs):
+    """Turns extract_company_metrics_async()'s flat return shape
+    ({key: {"fy26_q3":.., "fy25_q3":.., "found":.., "source_form":..,
+    "page_number":.., "evidence":.., "notes":..}}) back into one validated
+    FORM_SCHEMAS instance per form present in `specs` (master_metric_specs()
+    or a filtered subset of it).
+
+    A key `specs` lists but `raw` has no entry for (that form's pages were
+    never in the payload at all) is treated as not-found, the same "don't
+    invent a value" contract ExtractedValue enforces everywhere else - not
+    a KeyError.
+    """
+    by_form = collections.defaultdict(dict)
+    for m in specs:
+        key = m["key"]
+        v = raw.get(key) or {"found": False}
+        fields = {
+            "fy26_q3_value": v.get("fy26_q3"), "fy25_q3_value": v.get("fy25_q3"),
+            "found": v.get("found", False), "source_form": v.get("source_form"),
+            "page_number": v.get("page_number"), "evidence": v.get("evidence"),
+            "notes": v.get("notes"),
+        }
+        for form in m["forms"]:
+            if form in FORM_SCHEMAS:
+                by_form[form][key] = fields
+    return {form: FORM_SCHEMAS[form].model_validate(fields) for form, fields in by_form.items()}
