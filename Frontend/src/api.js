@@ -9,7 +9,10 @@
 // proxy (the backend allows CORS from the Vite dev ports).
 // ---------------------------------------------------------------------------
 
-const BASE = import.meta.env.VITE_API_BASE ?? "";
+// Trailing slash stripped defensively - a `VITE_API_BASE` with one would
+// otherwise produce a double slash before `/api` (e.g. `.../` + `/api/health`),
+// which the backend 404s on rather than collapsing.
+const BASE = (import.meta.env.VITE_API_BASE ?? "").replace(/\/+$/, "");
 
 class ApiError extends Error {
   constructor(message, status, detail) {
@@ -83,9 +86,11 @@ export const API = {
   getPeriods: () => request("/periods"),
 
   // -- pipeline ------------------------------------------------------------
-  /** Start a run. `stages` selects the halves: ["download"], ["build"], or both. */
-  startPipeline(fy, quarter, stages = ["download", "build"]) {
-    return request("/pipeline/run", { method: "POST", body: { fy, quarter, stages } });
+  /** Start a run. `stages` selects the halves: ["download"], ["build"], or both.
+   * `companies`, if given, is a subset of company ids to include; null/omitted
+   * means all configured sources. */
+  startPipeline(fy, quarter, stages = ["download", "build"], companies = null) {
+    return request("/pipeline/run", { method: "POST", body: { fy, quarter, stages, companies } });
   },
 
   getPipelineStatus(runId, signal) {
