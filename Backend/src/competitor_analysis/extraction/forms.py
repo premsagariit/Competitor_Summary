@@ -76,19 +76,92 @@ def _is_cumulative_header(text):
     return "up to" in low or "upto" in low or "period ended" in low
 
 
-def _header_events(table):
-    """[(row_idx, 'cur'|'prior', col_idx), ...] sorted by row_idx, for every
-    cumulative-column header cell found anywhere in the table."""
+_PERIOD_PHRASE_RE = re.compile(
+    r"(up\s*to|upto|for)\s+the\s+(?:corresponding\s+)?(quarter|period)", re.I)
+
+
+def classify_period_columns(table, cur_year_frag=None, prior_year_frag=None):
+    """For a pdfplumber-extracted table (a list of rows, each a list of
+    cells), classify every header-bearing column by which reporting period it
+    refers to.
+
+    Returns a list of {"row": row_idx, "col": col_idx,
+    "period": "current_cumulative" | "prior_cumulative" | "current_quarter" |
+    "prior_quarter" | "unknown" (period phrasing found but no year fragment
+    matched - never guessed), "header_text": the (possibly forward-filled)
+    header text, "forward_filled": bool}, in table reading order. A table can
+    carry several such events for the very same column - a "stacked block"
+    layout repeats the same column position once per year block, each at a
+    different row - so a caller resolves a specific data row's column by the
+    nearest PRECEDING event, never by assuming one classification per column
+    (see _col_for below).
+
+    Merged header cells surface from pdfplumber as None for every column
+    after a merge's first (leftmost) one; those are forward-filled here with
+    the last real header text seen earlier in the row, so every column of
+    the merged span carries it. A literal "-" is a printed nil in the filing,
+    not a merge continuation - it is never forward-filled itself, and it
+    never becomes the fill value for a later None.
+
+    "Cumulative" detection reuses _is_cumulative_header's looser substring
+    check (not just the stricter _PERIOD_PHRASE_RE below it), so this stays a
+    strict superset of every header this module has ever recognized as
+    cumulative - callers that only ever wanted that (get_line_item, via
+    _header_events) see identical behavior to before this function existed.
+    "Quarter" (single-period, non-cumulative) is new classification this
+    module didn't previously make at all, needed by callers that must label
+    every column rather than just find the one cumulative column they want.
+    """
+    if cur_year_frag is None or prior_year_frag is None:
+        _c, _p = year_frags()
+        cur_year_frag = cur_year_frag or _c
+        prior_year_frag = prior_year_frag or _p
+
     events = []
     for ridx, row in enumerate(table):
-        for i, cell in enumerate(row):
+        last = None
+        for cidx, cell in enumerate(row):
+            forward_filled = cell is None
+            if forward_filled:
+                cell = last
+            elif cell and str(cell).strip() != "-":
+                last = cell
             if not cell:
                 continue
             text = " ".join(str(cell).split())
-            if not _is_cumulative_header(text):
-                continue
-            events.append((ridx, i, text))
+
+            if _is_cumulative_header(text):
+                kind = "cumulative"
+            else:
+                m = _PERIOD_PHRASE_RE.search(text)
+                if not m:
+                    continue
+                kind = "cumulative" if m.group(1).lower().replace(" ", "").startswith(("upto", "up")) else "quarter"
+
+            if any(f.lstrip("-") in text for f in cur_year_frag):
+                period = f"current_{kind}"
+            elif any(f.lstrip("-") in text for f in prior_year_frag):
+                period = f"prior_{kind}"
+            else:
+                period = "unknown"
+            events.append({"row": ridx, "col": cidx, "period": period,
+                           "header_text": text, "forward_filled": forward_filled})
     return events
+
+
+def _header_events(table):
+    """[(row_idx, col_idx, text), ...] sorted by row_idx, for every
+    cumulative-column header cell found anywhere in the table.
+
+    A thin back-compat view over classify_period_columns(): restricted to
+    genuine (non-forward-filled) cumulative header cells, in the exact shape
+    _col_for below has always consumed. Excluding forward-filled columns
+    matters - without it, a merged period header spanning several sub-columns
+    would hand _col_for the RIGHTMOST sub-column instead of the anchor
+    _extend_to_total_column expects to walk rightward from."""
+    return [(e["row"], e["col"], e["header_text"])
+            for e in classify_period_columns(table)
+            if not e["forward_filled"] and e["period"].endswith("cumulative")]
 
 
 def _col_for(events, row_idx, year_frag):
