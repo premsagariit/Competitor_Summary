@@ -79,6 +79,13 @@ def _is_cumulative_header(text):
 _PERIOD_PHRASE_RE = re.compile(
     r"(up\s*to|upto|for)\s+the\s+(?:corresponding\s+)?(quarter|period)", re.I)
 
+# Point-in-time schedules (Balance Sheet, Investment/AUM, Offices) don't use
+# "up to"/"for the quarter" phrasing at all - they print a snapshot date pair
+# instead, e.g. "As at December 31, 2025" / "As at December 31, 2024". Still a
+# genuine current/prior comparison, just not a cumulative-vs-quarter one - so
+# it gets its own "snapshot" kind rather than being force-fit into either.
+_SNAPSHOT_PHRASE_RE = re.compile(r"as\s+(?:at|on)\b", re.I)
+
 
 def classify_period_columns(table, cur_year_frag=None, prior_year_frag=None):
     """For a pdfplumber-extracted table (a list of rows, each a list of
@@ -87,11 +94,12 @@ def classify_period_columns(table, cur_year_frag=None, prior_year_frag=None):
 
     Returns a list of {"row": row_idx, "col": col_idx,
     "period": "current_cumulative" | "prior_cumulative" | "current_quarter" |
-    "prior_quarter" | "unknown" (period phrasing found but no year fragment
-    matched - never guessed), "header_text": the (possibly forward-filled)
-    header text, "forward_filled": bool}, in table reading order. A table can
-    carry several such events for the very same column - a "stacked block"
-    layout repeats the same column position once per year block, each at a
+    "prior_quarter" | "current_snapshot" | "prior_snapshot" | "unknown"
+    (period phrasing found but no year fragment matched - never guessed),
+    "header_text": the (possibly forward-filled) header text,
+    "forward_filled": bool}, in table reading order. A table can carry
+    several such events for the very same column - a "stacked block" layout
+    repeats the same column position once per year block, each at a
     different row - so a caller resolves a specific data row's column by the
     nearest PRECEDING event, never by assuming one classification per column
     (see _col_for below).
@@ -108,9 +116,12 @@ def classify_period_columns(table, cur_year_frag=None, prior_year_frag=None):
     strict superset of every header this module has ever recognized as
     cumulative - callers that only ever wanted that (get_line_item, via
     _header_events) see identical behavior to before this function existed.
-    "Quarter" (single-period, non-cumulative) is new classification this
-    module didn't previously make at all, needed by callers that must label
-    every column rather than just find the one cumulative column they want.
+    "Quarter" and "snapshot" are new classifications this module didn't
+    previously make at all, needed by callers that must label every column
+    rather than just find the one cumulative column they want. Neither form
+    that actually feeds get_line_item today (NL-1, NL-2, NL-4) uses "as at"
+    phrasing, so adding snapshot detection cannot change get_line_item's
+    behavior - verified against all 7 companies' real filings.
     """
     if cur_year_frag is None or prior_year_frag is None:
         _c, _p = year_frags()
@@ -134,9 +145,12 @@ def classify_period_columns(table, cur_year_frag=None, prior_year_frag=None):
                 kind = "cumulative"
             else:
                 m = _PERIOD_PHRASE_RE.search(text)
-                if not m:
+                if m:
+                    kind = "cumulative" if m.group(1).lower().replace(" ", "").startswith(("upto", "up")) else "quarter"
+                elif _SNAPSHOT_PHRASE_RE.search(text):
+                    kind = "snapshot"
+                else:
                     continue
-                kind = "cumulative" if m.group(1).lower().replace(" ", "").startswith(("upto", "up")) else "quarter"
 
             if any(f.lstrip("-") in text for f in cur_year_frag):
                 period = f"current_{kind}"
