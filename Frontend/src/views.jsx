@@ -1,5 +1,5 @@
 import { AppIcon } from "./Icons.jsx";
-import { Card, Button, Spinner, Badge, ProgressBar, CircularProgress, PhaseStepper, CompanyAvatar, ActivityLog, formatElapsed } from "./ui.jsx";
+import { Card, Button, Spinner, Badge, Checkbox, ProgressBar, CircularProgress, PhaseStepper, CompanyAvatar, ActivityLog, formatElapsed } from "./ui.jsx";
 
 // ---------------------------------------------------------------------------
 // Shared small pieces
@@ -56,7 +56,7 @@ function phaseTone(status) {
 // ---------------------------------------------------------------------------
 // Overview
 // ---------------------------------------------------------------------------
-export function OverviewView({ state, onNavigate, onRun }) {
+export function OverviewView({ state, onNavigate, onRun, onToggleCompany, onSelectAll, onSelectNone }) {
   const { phases, companies, activity, running, elapsed, reportProgress } = state;
   const metricsTotal = Object.keys(companies).length * metricsTotalFor(state);
   const metricsDone = Object.values(companies).reduce((a, c) => a + c.extraction.metricsDone, 0);
@@ -101,6 +101,27 @@ export function OverviewView({ state, onNavigate, onRun }) {
         <PhaseStepper phases={phases} activeKey={null} onSelect={onNavigate} />
       </Card>
 
+      <Card className="p-5">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-sm font-semibold text-white">Companies to include</h3>
+          <div className="flex gap-2">
+            <Button variant="ghost" className="!py-1 !px-2 text-xs" disabled={running} onClick={onSelectAll}>Select all</Button>
+            <Button variant="ghost" className="!py-1 !px-2 text-xs" disabled={running} onClick={onSelectNone}>Select none</Button>
+          </div>
+        </div>
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
+          {state.companyList.map((c) => (
+            <Checkbox
+              key={c.id}
+              checked={state.selectedCompanies.has(c.id)}
+              disabled={running}
+              onChange={() => onToggleCompany(c.id)}
+              label={c.short}
+            />
+          ))}
+        </div>
+      </Card>
+
       <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
         <StatCard icon="building" label="Companies tracked" value={Object.keys(companies).length} tone="brand" />
         <StatCard icon="cpu" label="Metrics extracted" value={`${metricsDone}/${metricsTotal}`} tone="violet" />
@@ -113,8 +134,9 @@ export function OverviewView({ state, onNavigate, onRun }) {
           <div className="flex flex-col gap-3">
             {Object.entries(companies).map(([id, c]) => {
               const company = metaFor(state, id);
+              const isSelected = state.selectedCompanies.has(id);
               return (
-                <div key={id} className="flex items-center gap-3">
+                <div key={id} className={`flex items-center gap-3 ${isSelected ? "" : "opacity-40"}`}>
                   <CompanyAvatar company={company} size={28} />
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center justify-between text-xs mb-1">
@@ -152,13 +174,14 @@ function statusBadge(status) {
     failed: ["rose", "Failed"],
     retrying: ["amber", "Retrying"],
     missing: ["amber", "Missing"],
+    skipped: ["slate", "Not selected"],
   };
   const [tone, text] = map[status] || ["slate", status];
   return <Badge tone={tone}>{text}</Badge>;
 }
 
 function tierBadge(tier) {
-  const tones = { core: "slate", pro: "sky", ultra: "violet", search: "amber" };
+  const tones = { core: "slate", pro: "sky", ultra: "violet", search: "amber", "already-downloaded": "emerald" };
   return <Badge tone={tones[tier] || "slate"}>{tier}</Badge>;
 }
 
@@ -236,7 +259,7 @@ export function RetrievalView({ state, onRetry, onView, onDelete, onUpload, onCo
                   <AppIcon name="refresh" className="w-3.5 h-3.5" /> Retry retrieval
                 </Button>
               )}
-              {!hasFile && reviewable && (
+              {!hasFile && reviewable && c.retrieval.status !== "skipped" && (
                 <label className="w-full flex items-center justify-center gap-1.5 text-xs text-brand-300 border border-dashed border-brand-500/40 rounded-lg py-1.5 cursor-pointer hover:bg-brand-500/10">
                   <AppIcon name="upload" className="w-3.5 h-3.5" />
                   Upload file manually

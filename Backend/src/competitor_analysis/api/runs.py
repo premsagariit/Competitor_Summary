@@ -75,6 +75,7 @@ class RunState:
     companies: dict = field(default_factory=dict)
     activity: list = field(default_factory=list)
     stages: tuple = ("download", "build")
+    selected_companies: frozenset | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def log(self, level: str, text: str):
@@ -168,17 +169,22 @@ class RunRegistry:
             return rid
         return None
 
-    def start(self, fy: str, quarter: str, stages=("download", "build")) -> RunState:
+    def start(self, fy: str, quarter: str, stages=("download", "build"),
+              companies=None) -> RunState:
         """Create and begin a run. Raises RuntimeError if one is already in
         flight - the pipeline writes to shared files (the workbook, the
         download directory, the caches), so concurrent runs would corrupt
-        each other's state."""
+        each other's state.
+
+        `companies`, if given, is a subset of company ids (the same id space
+        GET /api/companies uses) to include; other configured sources are
+        left untouched for this run."""
         with self._lock:
             if self.active_run_id:
                 raise RuntimeError(
                     f"A run is already in progress ({self.active_run_id}). "
                     f"Wait for it to finish before starting another.")
-            run = _new_run(fy, quarter, stages)
+            run = _new_run(fy, quarter, stages, companies)
             self._runs[run.run_id] = run
             self._active = run.run_id
 
@@ -212,9 +218,10 @@ class RunRegistry:
         return run
 
 
-def _new_run(fy: str, quarter: str, stages) -> RunState:
+def _new_run(fy: str, quarter: str, stages, companies=None) -> RunState:
     run = RunState(run_id=uuid.uuid4().hex[:12], fy=fy, quarter=quarter,
-                   stages=tuple(stages))
+                   stages=tuple(stages),
+                   selected_companies=frozenset(companies) if companies is not None else None)
     run.phases = [
         PhaseState("retrieval", "Document Retrieval", "Phase 1"),
         PhaseState("extraction", "Data Extraction", "Phase 2"),
@@ -313,6 +320,11 @@ def _sync_retrieval_from_disk(run: RunState):
     avail = cfg.source_availability(run.fy, run.quarter)
     found = avail["companies_found"]
     for cs in run.companies.values():
+        # A company left out of this run's selection stays "skipped"
+        # regardless of what's on disk - the selection is independent of
+        # download state, by design.
+        if cs.retrieval_status == "skipped":
+            continue
         short = cfg.short_key_for_source(cs.name)
         # GIC is the industry workbook, not a per-company PDF, so it has its
         # own presence flag rather than an entry in companies_found.
@@ -336,9 +348,21 @@ def _phase_retrieval(run: RunState):
     run.set_phase("retrieval", "running")
     run.log("info", "Phase 1: retrieving filings from disclosure portals.")
     scraper.ATTEMPT_LOG.clear()
+
+    selected_keys = None
+    if run.selected_companies is not None:
+        by_id = {_company_id(key): key for key in scraper.load_sources()}
+        selected_keys = [by_id[i] for i in run.selected_companies if i in by_id]
+        skipped = [c.name for c in run.companies.values()
+                  if c.id not in run.selected_companies]
+        if skipped:
+            run.log("info", f"Excluded from this run: {', '.join(skipped)}.")
+
     for cs in run.companies.values():
-        cs.retrieval_status = "downloading"
-        cs.retrieval_progress = 5
+        if run.selected_companies is not None and cs.id not in run.selected_companies:
+            cs.retrieval_status, cs.retrieval_progress = "skipped", 0
+        else:
+            cs.retrieval_status, cs.retrieval_progress = "downloading", 5
 
     stop = threading.Event()
 
@@ -360,7 +384,7 @@ def _phase_retrieval(run: RunState):
     watcher = threading.Thread(target=watch, daemon=True)
     watcher.start()
     try:
-        asyncio.run(scraper.main(run.fy, run.quarter))
+        asyncio.run(scraper.main(run.fy, run.quarter, companies=selected_keys))
     finally:
         stop.set()
         watcher.join(timeout=2)
@@ -375,7 +399,8 @@ def _phase_retrieval(run: RunState):
         cs.retrieval_progress = 100
     _sync_retrieval_from_disk(run)
 
-    failed = [c.name for c in run.companies.values() if c.retrieval_status != "done"]
+    failed = [c.name for c in run.companies.values()
+              if c.retrieval_status not in ("done", "skipped")]
     run.set_phase("retrieval", "done" if not failed else "done")
     if failed:
         run.log("warn", f"{len(failed)} source(s) unavailable: {', '.join(failed)}. "
@@ -399,10 +424,20 @@ def _phase_extraction(run: RunState):
     short_keys = sorted(avail["companies_found"])
     gic_available = avail["gic_found"]
 
-    if not short_keys and not gic_available:
+    # A company left out of this run's selection is excluded here too,
+    # independent of whether its file is actually on disk - selection scopes
+    # extraction exactly like it scopes retrieval.
+    gic_selected = (run.selected_companies is None
+                    or _company_id("GIC") in run.selected_companies)
+    if run.selected_companies is not None:
+        short_keys = [k for k in short_keys
+                      if cfg.company_slug(k) in run.selected_companies]
+
+    if not short_keys and not (gic_available and gic_selected):
         raise RuntimeError(
-            f"No source documents found for {run.fy} {run.quarter} - nothing to "
-            f"extract. Run the download stage first, or upload the filings.")
+            f"No source documents found for the selected companies in "
+            f"{run.fy} {run.quarter} - nothing to extract. Run the download "
+            f"stage first, or upload the filings.")
 
     present_ids = {cfg.company_slug(k) for k in short_keys}
     for cs in run.companies.values():
@@ -410,8 +445,11 @@ def _phase_extraction(run: RunState):
             # GIC feeds the industry slides via a different path (the
             # workbook, not per-company metric extraction), so it has no
             # per-company metric progress to report.
-            cs.extraction_status = "done" if gic_available else "missing"
-            cs.extraction_progress = 100 if gic_available else 0
+            if not gic_selected:
+                cs.extraction_status, cs.extraction_progress = "skipped", 0
+            else:
+                cs.extraction_status = "done" if gic_available else "missing"
+                cs.extraction_progress = 100 if gic_available else 0
         elif cs.id in present_ids:
             cs.extraction_status = "extracting"
             cs.extraction_progress = 10
@@ -440,7 +478,7 @@ def _phase_extraction(run: RunState):
         run.log("warn", f"Present on disk but not registered for extraction: "
                         f"{', '.join(missing_from_cache)}")
 
-    pipeline_mod.run_phase2(ws, companies=runnable, run_gic=gic_available)
+    pipeline_mod.run_phase2(ws, companies=runnable, run_gic=gic_available and gic_selected)
 
     engine_path = cfg.data_engine_output_path()
     paths.ensure_parent(engine_path)

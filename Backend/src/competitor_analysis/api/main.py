@@ -92,6 +92,10 @@ class RunRequest(BaseModel):
         description='Which halves to run: "download" (Phase 1) and/or "build" '
                     '(Phases 2-3). Splitting them allows a human check on the '
                     'retrieved files before extraction.')
+    companies: list[str] | None = Field(
+        default=None,
+        description="Subset of company ids (GET /api/companies `id` field) to "
+                    "include in this run. Omit or null for all configured sources.")
 
 
 def _serialise_run(run) -> dict:
@@ -204,8 +208,11 @@ def start_run(req: RunRequest):
     if bad:
         raise HTTPException(status_code=400,
                             detail=f"Unknown stage(s): {bad}. Use 'download' and/or 'build'.")
+    if req.companies is not None and len(req.companies) == 0:
+        raise HTTPException(status_code=400,
+                            detail="At least one company must be selected to run the pipeline.")
     try:
-        run = REGISTRY.start(fy, quarter, stages=req.stages)
+        run = REGISTRY.start(fy, quarter, stages=req.stages, companies=req.companies)
     except RuntimeError as e:
         # 409: the pipeline writes shared files, so runs must not overlap.
         raise HTTPException(status_code=409, detail=str(e))

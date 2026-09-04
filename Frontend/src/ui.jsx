@@ -68,6 +68,21 @@ export function Badge({ children, tone = "slate" }) {
   );
 }
 
+export function Checkbox({ checked, onChange, disabled, label, className = "" }) {
+  return (
+    <label className={`inline-flex items-center gap-2 text-sm text-slate-300 ${disabled ? "opacity-40 cursor-not-allowed" : "cursor-pointer"} ${className}`}>
+      <input
+        type="checkbox"
+        checked={checked}
+        disabled={disabled}
+        onChange={onChange}
+        className="w-4 h-4 rounded border-slate-700 bg-slate-800 accent-brand-500 focus:ring-brand-500/40 focus:ring-offset-0"
+      />
+      {label}
+    </label>
+  );
+}
+
 export function Spinner({ className = "w-4 h-4" }) {
   return <AppIcon name="loader" className={`${className} animate-spin-slow text-current`} />;
 }

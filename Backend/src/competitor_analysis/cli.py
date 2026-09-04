@@ -35,6 +35,9 @@ def parse_args():
                               "data/downloads/{FY}/{Quarter}/. all: both, back to back.")
     parser.add_argument("--download", choices=["yes", "no"],
                          help="Deprecated alias for --stage: 'yes' => all, 'no' => build.")
+    parser.add_argument("--companies",
+                         help="Comma-separated source_links.json keys to restrict retrieval "
+                              "to (default: all configured sources).")
     return parser.parse_args()
 
 
@@ -52,12 +55,15 @@ def print_availability(fy: str, quarter: str) -> dict:
     return avail
 
 
-def run_download(fy: str, quarter: str) -> dict:
+def run_download(fy: str, quarter: str, companies: list[str] | None = None) -> dict:
     """Phase 1 only. Returns the resulting source-availability dict.
 
     Deliberately does NOT import the period-dependent modules (pdf_cache and
     everything downstream of it bake in which PDFs exist at import time) -
     that's the build stage's job, once the files have settled.
+
+    `companies`, if given, restricts retrieval to that subset of
+    source_links.json keys; other configured sources are left untouched.
     """
     cfg.set_period(fy, quarter)
     fy, quarter = cfg.FY, cfg.QUARTER
@@ -66,7 +72,7 @@ def run_download(fy: str, quarter: str) -> dict:
 
     print(f"=== Phase 1: downloading source files for {fy} {quarter} ===")
     print(f"Target directory: {cfg.download_dir()}\n")
-    asyncio.run(scraper.main(fy, quarter))
+    asyncio.run(scraper.main(fy, quarter, companies=companies))
     print()
 
     avail = print_availability(fy, quarter)
@@ -133,10 +139,10 @@ def run_build(fy: str, quarter: str) -> dict:
     return summary
 
 
-def run(fy: str, quarter: str, download: bool) -> dict:
+def run(fy: str, quarter: str, download: bool, companies: list[str] | None = None) -> dict:
     """Phase 1 (optional) then Phase 2 + 3, in one process."""
     if download:
-        run_download(fy, quarter)
+        run_download(fy, quarter, companies=companies)
     return run_build(fy, quarter)
 
 
@@ -145,13 +151,14 @@ def main():
     stage = args.stage
     if args.download is not None:
         stage = "all" if args.download == "yes" else "build"
+    companies = [c.strip() for c in args.companies.split(",")] if args.companies else None
     try:
         if stage == "download":
-            run_download(args.fy, args.quarter)
+            run_download(args.fy, args.quarter, companies=companies)
         elif stage == "build":
             run_build(args.fy, args.quarter)
         else:
-            run(args.fy, args.quarter, download=True)
+            run(args.fy, args.quarter, download=True, companies=companies)
     except (ValueError, RuntimeError) as e:
         print(f"\nERROR: {e}", file=sys.stderr)
         sys.exit(1)

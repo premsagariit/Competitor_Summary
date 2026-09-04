@@ -624,6 +624,8 @@ async def process_company(company_key: str, data: dict, fy: str, quarter: str, t
     cal_data = get_calendar_mapping(fy, quarter)
     is_gic = company_key == "GIC"
     file_type = "XLSX" if is_gic else "PDF"
+    ext = file_type.lower()
+    final_name = cfg.download_filename(company_key, ext)
     started = asyncio.get_event_loop().time()
 
     def record(method: str, detail: str = ""):
@@ -632,6 +634,14 @@ async def process_company(company_key: str, data: dict, fy: str, quarter: str, t
             "detail": detail,
             "seconds": round(asyncio.get_event_loop().time() - started, 1),
         }
+
+    # ---- Step 0: skip entirely if this period's file is already on disk ----
+    dest = target_dir / final_name
+    if dest.exists():
+        record("already-downloaded")
+        print(f"[{company_key}] {final_name} already present for {quarter} {fy} "
+              f"- retrieval done, skipping agent dispatch.")
+        return
 
     # ---- Step 1: cheap deterministic attempts, before any agent is billed ----
     # A cached pattern from a previous quarter, or GIC's known fixed path. Both
@@ -654,9 +664,6 @@ async def process_company(company_key: str, data: dict, fy: str, quarter: str, t
         print(f"[{company_key}] No direct URL worked; falling back to the agent.")
 
     ladder = ladder_for(data)
-
-    ext = file_type.lower()
-    final_name = cfg.download_filename(company_key, ext)
 
     async def run_processor(processor: str, feedback: str | None, dest_name: str | None = None):
         """Resolve + download for one processor. Returns (path, content).
@@ -769,9 +776,15 @@ def _retry_feedback(content: dict, cal_data: dict) -> str:
     )
 
 
-async def main(fy: str, quarter: str):
+async def main(fy: str, quarter: str, companies: list[str] | None = None):
     print(f"Starting Phase 1 Agentic Retrieval for {quarter} {fy}...\n")
     sources = load_sources()
+    if companies is not None:
+        selected = set(companies)
+        unknown = selected - set(sources)
+        if unknown:
+            print(f"[main] Ignoring unknown company key(s): {sorted(unknown)}")
+        sources = {k: v for k, v in sources.items() if k in selected}
     target_dir = ensure_download_dir(fy, quarter)
 
     started = asyncio.get_event_loop().time()

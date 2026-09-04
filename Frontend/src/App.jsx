@@ -66,6 +66,7 @@ export default function App() {
 
   const [backend, setBackend] = useState({ status: "connecting", detail: null });
   const [companyList, setCompanyList] = useState([]);
+  const [selectedCompanies, setSelectedCompanies] = useState(() => new Set());
   const [periods, setPeriods] = useState([]);
 
   const [runId, setRunId] = useState(null);
@@ -97,6 +98,7 @@ export default function App() {
       setBackend({ status: "online", detail: health.backendRoot });
       setCompanyList(list);
       setCompanies((prev) => (Object.keys(prev).length ? prev : idleCompanies(list)));
+      setSelectedCompanies((prev) => (prev.size ? prev : new Set(list.map((c) => c.id))));
       setFyOptions(periodInfo.fyOptions);
       setQuarterOptions(periodInfo.quarterOptions);
       setPeriods(periodInfo.periods);
@@ -199,6 +201,14 @@ export default function App() {
   // -- actions ---------------------------------------------------------------
   async function startRun(stages) {
     if (running) return;
+    if (selectedCompanies.size === 0) {
+      toast({
+        kind: "error",
+        title: "No companies selected",
+        description: "Select at least one company before starting a run.",
+      });
+      return;
+    }
     setElapsed(0);
     setReportProgress(0);
     setReportReady(false);
@@ -207,7 +217,7 @@ export default function App() {
     setRunStatus("queued");
     setActivity([{ level: "info", text: `Starting ${fy} ${quarter} (${stages.join(" + ")})…`, time: nowTime() }]);
     try {
-      const run = await API.startPipeline(fy, quarter, stages);
+      const run = await API.startPipeline(fy, quarter, stages, Array.from(selectedCompanies));
       setRunId(run.runId);
       setRunning(true);
       applySnapshot(run);
@@ -231,6 +241,17 @@ export default function App() {
   // continueToBuild() for the second half.
   const runPipeline = () => startRun(["download"]);
   const runBuildOnly = () => startRun(["build"]);
+
+  function toggleCompany(id) {
+    setSelectedCompanies((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+  const selectAllCompanies = () => setSelectedCompanies(new Set(companyList.map((c) => c.id)));
+  const selectNoCompanies = () => setSelectedCompanies(new Set());
 
   async function continueToBuild() {
     if (!runId) return;
@@ -319,7 +340,7 @@ export default function App() {
   const state = {
     fy, quarter, phases, companies, activity, running, runStatus, elapsed,
     reportProgress, reportSections, companyMeta, runId, reportReady,
-    selectedPeriod, backend,
+    selectedPeriod, backend, companyList, selectedCompanies,
   };
 
   const NAV = [
@@ -498,7 +519,16 @@ export default function App() {
         </header>
 
         <main className="flex-1 overflow-y-auto p-6">
-          {view === "overview" && <OverviewView state={state} onNavigate={setView} onRun={runPipeline} />}
+          {view === "overview" && (
+            <OverviewView
+              state={state}
+              onNavigate={setView}
+              onRun={runPipeline}
+              onToggleCompany={toggleCompany}
+              onSelectAll={selectAllCompanies}
+              onSelectNone={selectNoCompanies}
+            />
+          )}
           {view === "retrieval" && (
             <RetrievalView
               state={state}
