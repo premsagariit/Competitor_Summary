@@ -2,6 +2,7 @@ services:
   - type: web
     name: competitor-analysis-api
     runtime: python
+    plan: free
     rootDir: Backend
     buildCommand: pip install -e .
     startCommand: uvicorn competitor_analysis.api.main:app --host 0.0.0.0 --port $PORT
