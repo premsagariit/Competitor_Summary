@@ -1,10 +1,18 @@
 # Known issues — logged, deliberately not fixed
 
-Findings surfaced while refactoring Phase 2 Stage 3 extraction to Pydantic
-schemas (commits `2b4ff61`..`e391238`). Each was diagnosed, confirmed against
-real data, and then **deliberately left alone** as out of that refactor's
-scope — not overlooked. Recorded here with the evidence and the distinguishing
-facts that were expensive to establish, so none of them needs re-deriving.
+Two **open** findings from refactoring Phase 2 Stage 3 extraction to Pydantic
+schemas (commits `2b4ff61`..`e391238`). Neither was *introduced* by that
+refactor — both are pre-existing pipeline behavior — but both were diagnosed,
+confirmed against real data, and then **deliberately left unfixed** as out of
+that refactor's scope. A fix was scoped for each; neither was applied.
+Recorded here with the evidence and the distinguishing facts that were
+expensive to establish, so neither needs re-deriving.
+
+An appendix below covers three *closed* findings from the same session -
+already investigated and explained, not open follow-ups. Keep the two
+categories separate: sections 1-2 are "here's a bug, here's the fix shape";
+the appendix is "here's why this isn't a bug," kept only so it doesn't get
+mistaken for a new problem or re-investigated later.
 
 ---
 
@@ -136,11 +144,16 @@ silently dropping or "correcting" them. The evidence/notes audit trail
 
 ---
 
-## Appendix — related data-completeness gaps
+## Appendix — closed findings, not open follow-ups
 
-Added beyond the two items above because they were also explicit
-"flag, don't touch" decisions in the same session and would otherwise need
-rediscovering. Strike if not wanted.
+These three are **pre-existing pipeline behavior noticed while verifying
+this refactor, already investigated and explained during this session** -
+distinct from sections 1-2 above, which remain open with a fix scoped. None
+of these three has a fix pending: each was traced to a specific, understood
+cause (a page-detection gap, a model-reasoning limit on a non-standard
+layout, a genuinely missing input document) and concluded not-a-bug. Kept
+here only so a future reader doesn't mistake the underlying gap for a new
+problem or re-run the same investigation. Strike if not wanted.
 
 **Care Health / NL-29 — zero pages detected.** `pdf_cache` finds *no* page
 matching the NL-29 pattern in this company's PDF, so the payload is empty
