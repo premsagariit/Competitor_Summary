@@ -156,14 +156,16 @@ silently dropping or "correcting" them. The evidence/notes audit trail
 
 ## Appendix — closed findings, not open follow-ups
 
-These three are **pre-existing pipeline behavior noticed while verifying
+These four are **pre-existing pipeline behavior noticed while verifying
 this refactor, already investigated and explained during this session** -
 distinct from sections 1-2 above, which remain open with a fix scoped. None
-of these three has a fix pending: each was traced to a specific, understood
+of these four has a fix pending: three were traced to a specific, understood
 cause (a page-detection gap, a model-reasoning limit on a non-standard
-layout, a genuinely missing input document) and concluded not-a-bug. Kept
-here only so a future reader doesn't mistake the underlying gap for a new
-problem or re-run the same investigation. Strike if not wanted.
+layout, a genuinely missing input document) and concluded not-a-bug; the
+fourth documents a working mechanism, not a gap - see below. Kept here only
+so a future reader doesn't mistake the underlying gap for a new problem, or
+rediscover an undocumented mechanism the hard way, or re-run the same
+investigation. Strike if not wanted.
 
 **Care Health / NL-29 — zero pages detected.** `pdf_cache` finds *no* page
 matching the NL-29 pattern in this company's PDF, so the payload is empty
@@ -190,3 +192,48 @@ document this pipeline never downloads. This is a missing input document, not
 a bug: `gemini.py`'s prompt and the NL-41 annotations are correct as written.
 Recorded because this one already cost one investigation cycle after being
 mistaken for pipeline output.
+
+**NL-29 maturity-bucket swap — a working mechanism, not a gap.**
+`data_engine.py:1341-1359`, inside `apply_company_gemini_pipeline`. Predates
+every commit in this refactor and this session's other work - introduced in
+`cc8003c`, well before `2b4ff61`. Not part of the Pydantic schema work and
+not related to `schemas.py`'s retry-isolate mechanism, even though the two
+compose (see below).
+
+Some insurers' Detail Regarding Debt Securities schedule omits the "More than
+7 years and upto 10 years" maturity row entirely (rather than printing "-")
+when they have zero allocation there, instead of the fixed 5-bucket template
+every other field assumes - and GT's own row-builder made the same
+assumption, folding that allocation into the "Above 10 years" figure. The
+shim's condition, read directly off the extraction's raw (pre-conversion)
+dict:
+
+```python
+k_7_10 = "debt_maturity_More than 7 years and upto 10 years"
+k_above10 = "debt_maturity_Above 10 years"
+if not raw.get(k_7_10, {}).get("found") and raw.get(k_above10, {}).get("found"):
+    raw_for_derivation[k_7_10] = raw[k_above10]
+    raw_for_derivation[k_above10] = {"fy26_q3": None, "fy25_q3": None, "found": False, ...}
+```
+
+When the 7-10yr bucket is unresolved but Above-10yr is found, Above-10yr's
+value is copied into the 7-10yr slot for derivation, and Above-10yr's own
+slot is zeroed out - both changes applied to a copy (`raw_for_derivation`),
+so `write_extraction_audit`'s audit trail still shows the model's original,
+unswapped answer for both fields.
+
+**Confirmed firing for real**, Narayana Health, FY25-26 Q3 live validation
+run (run `851b622f1f26`, 2026-09-05): the audit shows `debt_maturity_Above
+10 years` found=true (67.0/50.0, evidence quoting "above 10 years: ... 67%
+... 50%") and `debt_maturity_More than 7 years and upto 10 years` found=false
+("validation failed after retry"). The downloaded workbook's Slide 26 shows
+"More than 7 years and upto 10 years" = 0.67/0.5 (Above-10yr's converted
+value) and "Above 10 years" = None/None - re-verified against every Slide-26
+row for all 7 companies, unfiltered, to rule out a row-misalignment reading
+rather than a real swap.
+
+This is the first confirmed case of the shim composing with `schemas.py`'s
+retry-isolate mechanism: the shim only reads the raw dict's `found` flag,
+indifferent to *why* a key ended up not-found (a genuinely missing row vs.
+this refactor's validation-retry-then-isolate outcome), so the two combine
+correctly without either needing to know about the other.
