@@ -24,10 +24,13 @@ services:
         sync: false
       - key: CORS_ALLOWED_ORIGINS
         sync: false
-      # Memory tuning for the free plan's 512MB cap: Phase 2 parses all 7
-      # insurer PDFs concurrently (pdfplumber's object graph is heavy per
-      # document) and issues Gemini calls concurrently on top of that -
-      # both default higher (3 / 8) for a dev machine with real headroom.
+      # Memory tuning for the free plan's 512MB cap. Phase 2 parses the
+      # insurer PDFs concurrently and issues Gemini calls concurrently on
+      # top of that; both default higher (3 / 8) for a dev machine with
+      # real headroom. Measured end to end at these values, cold caches:
+      # 317MB peak for Phase 2 + Phase 3. Raise them only against a fresh
+      # measurement - before pdf_cache released per-page caches, a single
+      # 51-page filing peaked at 822MB and OOM-killed the instance.
       - key: PDF_PARSE_MAX_WORKERS
         value: "2"
       - key: GEMINI_MAX_CONCURRENCY

@@ -156,6 +156,17 @@ def parse_pdf_to_json(pdf_path, company):
                 "tables": page.extract_tables(),
                 "text": text,
             })
+            # Release this page's parsed object graph before moving on.
+            # extract_text/extract_tables populate Page._objects, _edges and
+            # _layout, and pdf.pages holds every Page for the life of the
+            # document - so without this the entire PDF's object graph is
+            # retained at once. Measured on Star Health's 51-page filing:
+            # 822MB peak RSS before, 196MB after, same runtime. That one
+            # document exceeded Render's 512MB free tier on its own, and the
+            # cost tracks page complexity rather than file size (ABHI's
+            # 1.5MB filing retained 560MB). close() only drops those caches -
+            # the page re-parses on demand if a caller needs it again.
+            page.close()
     stat = os.stat(pdf_path)
     return {
         "company": company,

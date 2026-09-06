@@ -433,3 +433,49 @@ def test_cached_calls_do_not_consume_quota(monkeypatch):
     out = asyncio.run(g._call_with_retry("ACME", PAYLOAD, SPECS[:2], limiter))
     assert out is not None and len(out) == 2
     assert acquired == [], "a cache hit consumed a rate-limit slot"
+
+
+# ---------------------------------------------------------------------------
+# Memory: pdfplumber page caches must be released during the parse
+# ---------------------------------------------------------------------------
+
+def test_parse_releases_each_page_cache(monkeypatch):
+    """Every page must be closed as the parse walks past it.
+
+    extract_text/extract_tables populate Page._objects/_edges/_layout, and
+    pdf.pages holds every Page for the document's lifetime - so skipping
+    close() retains the entire PDF's object graph at once. Measured on Star
+    Health's 51-page filing that was 822MB peak RSS versus 196MB with it,
+    which on its own exceeded Render's 512MB free tier and took Phase 2 down
+    with an out-of-memory kill.
+    """
+    from competitor_analysis.extraction import pdf_cache
+
+    closed = []
+
+    class FakePage:
+        def __init__(self, n):
+            self.n = n
+        def extract_text(self):
+            return f"FORM NL-1-B-RA page {self.n}"
+        def extract_tables(self):
+            return [[["a", "b"]]]
+        def close(self):
+            closed.append(self.n)
+
+    class FakePdf:
+        pages = [FakePage(i) for i in range(5)]
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(pdf_cache.pdfplumber, "open", lambda p: FakePdf())
+    monkeypatch.setattr(pdf_cache.os, "stat",
+                        lambda p: type("S", (), {"st_mtime": 1.0, "st_size": 2})())
+
+    doc = pdf_cache.parse_pdf_to_json("ignored.pdf", "TestCo")
+
+    assert closed == [0, 1, 2, 3, 4], "every page must be closed, in order"
+    # And the parse still returns the content it is supposed to.
+    assert len(doc["pages"]) == 5
+    assert doc["pages"][0]["forms_detected"] == ["NL-1"]
+    assert doc["pages"][0]["tables"] == [[["a", "b"]]]
