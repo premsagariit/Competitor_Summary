@@ -468,10 +468,12 @@ def _phase_extraction(run: RunState):
     p.sync_period_headers(ws)
     p.clear_period_values(ws)
 
-    # pdf_cache resolves which PDFs exist at import time, so only extract for
-    # companies it actually knows about - a file present on disk but absent
-    # from its map would fail mid-run.
+    # Re-scan before reading the map: this process may have served an earlier
+    # run for a different period, and Phase 1 downloads land after
+    # set_period. Without it, extraction reads whichever period's PDFs were
+    # on disk when the module was first imported.
     from competitor_analysis.extraction import pdf_cache
+    pdf_cache.refresh_company_pdfs()
     runnable = [k for k in short_keys if k in pdf_cache.COMPANY_PDFS]
     missing_from_cache = sorted(set(short_keys) - set(runnable))
     if missing_from_cache:

@@ -160,3 +160,96 @@ def test_legacy_and_canonical_resolve_to_the_same_paths():
     otherwise the migration would silently split the data in two."""
     assert cfg.download_dir("FY26", "Q3") == cfg.download_dir("FY25-26", "Q3")
     assert cfg.gic_path("FY26", "Q3") == cfg.gic_path("FY25-26", "Q3")
+
+
+# ---------------------------------------------------------------------------
+# Period-derived state must follow set_period(), not import order
+# ---------------------------------------------------------------------------
+
+def _seed(root, quarter, companies):
+    d = root / "FY25-26" / quarter
+    d.mkdir(parents=True, exist_ok=True)
+    for c in companies:
+        (d / cfg.COMPANY_PDF_FILENAMES[c]).write_bytes(b"%PDF-1.4\n")
+
+
+def test_switching_period_repoints_the_insurer_pdf_map(tmp_path, monkeypatch):
+    """A second run for a different quarter, in the same process, must read
+    that quarter's filings.
+
+    pdf_cache used to resolve COMPANY_PDFS once at import, so in the
+    long-lived API server a Q4 run following a Q3 run read Q3's PDFs while
+    writing a Q4-labelled workbook and Q4 cache entries - wrong, and silent,
+    because the numbers looked entirely plausible."""
+    from competitor_analysis import paths
+    from competitor_analysis.extraction import pdf_cache
+
+    _seed(tmp_path, "Q3", ["NBHI", "ABHI"])
+    _seed(tmp_path, "Q4", ["NBHI"])
+    monkeypatch.setattr(paths, "DOWNLOADS_DIR", tmp_path)
+
+    cfg.set_period("FY25-26", "Q3")
+    assert set(pdf_cache.COMPANY_PDFS) == {"NBHI", "ABHI"}
+    assert "Q3" in pdf_cache.COMPANY_PDFS["NBHI"]
+
+    cfg.set_period("FY25-26", "Q4")
+    assert set(pdf_cache.COMPANY_PDFS) == {"NBHI"}, "Q4 must not inherit Q3's insurers"
+    assert "Q4" in pdf_cache.COMPANY_PDFS["NBHI"]
+
+
+def test_the_pdf_map_is_mutated_in_place_so_importers_see_the_switch(tmp_path, monkeypatch):
+    """forms, gemini and data_engine all bind the dict by name at import
+    (`from ... import COMPANY_PDFS`), so refreshing it by REBINDING in
+    pdf_cache would leave every one of them pointing at the old period."""
+    from competitor_analysis import paths
+    from competitor_analysis.extraction import pdf_cache, forms, gemini, data_engine
+
+    _seed(tmp_path, "Q3", ["NBHI", "ABHI"])
+    _seed(tmp_path, "Q4", ["NBHI"])
+    monkeypatch.setattr(paths, "DOWNLOADS_DIR", tmp_path)
+
+    cfg.set_period("FY25-26", "Q4")
+    for mod in (forms, gemini, data_engine):
+        assert mod.COMPANY_PDFS is pdf_cache.COMPANY_PDFS
+        assert "Q4" in mod.COMPANY_PDFS["NBHI"], f"{mod.__name__} still sees the old period"
+
+
+def test_pdfs_arriving_after_set_period_are_picked_up(tmp_path, monkeypatch):
+    """Phase 1 downloads into the period's directory AFTER the period is set,
+    so the refresh must re-scan the filesystem rather than cache on the
+    period alone."""
+    from competitor_analysis import paths
+    from competitor_analysis.extraction import pdf_cache
+
+    _seed(tmp_path, "Q4", ["NBHI"])
+    monkeypatch.setattr(paths, "DOWNLOADS_DIR", tmp_path)
+
+    cfg.set_period("FY25-26", "Q4")
+    assert set(pdf_cache.COMPANY_PDFS) == {"NBHI"}
+
+    _seed(tmp_path, "Q4", ["Star Health"])          # lands mid-run
+    pdf_cache.refresh_company_pdfs()
+    assert set(pdf_cache.COMPANY_PDFS) == {"NBHI", "Star Health"}
+
+
+def test_reverse_lookup_drops_the_old_period(tmp_path, monkeypatch):
+    """_PDF_TO_COMPANY must be rebuilt alongside COMPANY_PDFS, not merely
+    added to: it names the company an uncached parse is filed under, so a
+    surviving entry for the previous period's path keeps that file
+    attributable after the switch."""
+    from competitor_analysis import paths
+    from competitor_analysis.extraction import pdf_cache
+    import os
+
+    _seed(tmp_path, "Q3", ["NBHI"])
+    _seed(tmp_path, "Q4", ["NBHI"])
+    monkeypatch.setattr(paths, "DOWNLOADS_DIR", tmp_path)
+
+    cfg.set_period("FY25-26", "Q3")
+    q3_path = pdf_cache.COMPANY_PDFS["NBHI"]
+    cfg.set_period("FY25-26", "Q4")
+    q4_path = pdf_cache.COMPANY_PDFS["NBHI"]
+
+    assert q3_path != q4_path
+    assert pdf_cache._company_for_path(q4_path) == "NBHI"
+    assert os.path.normpath(q3_path) not in pdf_cache._PDF_TO_COMPANY

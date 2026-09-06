@@ -30,7 +30,8 @@ CACHE_ROOT = str(paths.PDF_JSON_CACHE)
 COMPANY_PDF_FILENAMES = cfg.COMPANY_PDF_FILENAMES
 
 
-def discover_company_pdfs(fy: str = None, quarter: str = None) -> dict:
+def discover_company_pdfs(fy: str = None, quarter: str = None,
+                          announce_missing: bool = True) -> dict:
     """{company: path} restricted to insurers whose PDF actually exists under
     downloads/{fy}/{quarter}/ - a missing insurer is logged and simply
     omitted, so every downstream stage (which iterates this dict's keys)
@@ -41,13 +42,55 @@ def discover_company_pdfs(fy: str = None, quarter: str = None) -> dict:
         path = os.path.join(base, filename)
         if os.path.exists(path):
             out[company] = path
-        else:
+        elif announce_missing:
             print(f"[pdf_cache] {company}: PDF not found at {path} - skipping this insurer.")
     return out
 
 
-COMPANY_PDFS = discover_company_pdfs()
-_PDF_TO_COMPANY = {os.path.normpath(v): k for k, v in COMPANY_PDFS.items()}
+# Mutated IN PLACE by refresh_company_pdfs(), never rebound - forms.py,
+# gemini.py and data_engine.py all hold `from ... import COMPANY_PDFS`
+# bindings to this exact dict, so rebinding here would leave them stale.
+COMPANY_PDFS = {}
+_PDF_TO_COMPANY = {}
+
+
+def refresh_company_pdfs():
+    """Re-resolve which insurer PDFs exist for the configured period.
+
+    Registered as a config period-change listener below, and called directly
+    by the stages that read the map, because it goes stale two ways:
+
+    1. Period. The map used to be resolved once at import. A fresh CLI
+       process is fine (cli.run_build sets the period before importing), but
+       the API server is long-lived: after a Q3 run had imported this module,
+       a Q4 run in the same process read Q3's PDFs while writing a
+       Q4-labelled workbook and Q4 cache entries - silent and plausible.
+       api/runs.py's guard does not catch that: it checks which companies are
+       known, not which period their paths point at.
+    2. Filesystem. Phase 1 downloads into the period's directory *after* the
+       period is set, so a scan pinned to the period alone would still miss
+       files that landed in between.
+
+    Re-scans every call (seven os.path.exists) but only mutates and reports
+    when the result actually differs, so repeat calls are quiet."""
+    if cfg.FY is None or cfg.QUARTER is None:
+        return COMPANY_PDFS  # period not set yet; the listener will populate
+    fresh = discover_company_pdfs(announce_missing=False)
+    if fresh == COMPANY_PDFS:
+        return COMPANY_PDFS
+    missing = sorted(set(COMPANY_PDF_FILENAMES) - set(fresh))
+    COMPANY_PDFS.clear()
+    COMPANY_PDFS.update(fresh)
+    _PDF_TO_COMPANY.clear()
+    _PDF_TO_COMPANY.update({os.path.normpath(v): k for k, v in fresh.items()})
+    for company in missing:
+        print(f"[pdf_cache] {company}: PDF not found in {cfg.download_dir()} "
+              f"- skipping this insurer.")
+    return COMPANY_PDFS
+
+
+refresh_company_pdfs()
+cfg.on_period_change(refresh_company_pdfs)
 
 # Canonical form-detection regex set - every NL form either extraction path
 # looks for. Keyed by the short tag used in the Data Engine's "Source Tab"

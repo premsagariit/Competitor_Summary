@@ -2,11 +2,12 @@
 Single source of truth for which reporting period (FY + Quarter) the pipeline
 is currently running against.
 
-`set_period()` must be called before importing any module whose module-level
-constants derive a path from the active period (pdf_cache, data_engine,
-pdf_report, etc.) - those modules read FY/QUARTER off this module at import
-time. cli.py is the only entrypoint that does this ordering
-correctly; don't import period-dependent modules before calling set_period().
+Modules whose module-level constants derive from the active period register a
+callback via `on_period_change()`; `set_period()` fires them, so those
+constants follow the period instead of being frozen at import time. This
+matters most in the long-lived API server, where a second run for a different
+quarter reuses modules the first run already imported - see
+pdf_cache.refresh_company_pdfs().
 """
 import os
 import re
@@ -154,6 +155,19 @@ _QUARTER_MONTHS = {
 }
 
 
+_period_listeners = []
+
+
+def on_period_change(fn):
+    """Register `fn()` to run whenever set_period() changes the period.
+
+    Lets a module keep period-derived state (which insurer PDFs exist on
+    disk, say) correct without every entrypoint having to remember to
+    refresh it, and without this module importing its dependents."""
+    _period_listeners.append(fn)
+    return fn
+
+
 def set_period(fy: str, quarter: str):
     """Set the reporting period. `fy` is normalised to the canonical span
     form, so callers may pass FY25-26, FY26, 2025-26 or 2025-2026."""
@@ -163,6 +177,8 @@ def set_period(fy: str, quarter: str):
     if quarter not in _QUARTERS:
         raise ValueError(f"Invalid quarter {quarter!r} - expected one of {_QUARTERS}.")
     FY, QUARTER = fy, quarter
+    for fn in _period_listeners:
+        fn()
 
 
 def _require(fy, quarter):
