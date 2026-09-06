@@ -1315,13 +1315,14 @@ def compute_derived_metrics(company, regrouped, kind_by_key, income):
     return D
 
 
-def prefetch_income_statements(companies, max_workers=PDF_PARSE_MAX_WORKERS):
+def prefetch_income_statements(companies, max_workers=PDF_PARSE_MAX_WORKERS,
+                               on_company_done=None):
     """Stage 2's per-company PDF extraction, run concurrently.
 
     Independent per company and I/O/CPU-bound in pdfplumber, so a thread pool
     is enough; results land in the same cache the sequential path used, so the
     sheet-writing stage is unchanged."""
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     todo = [c for c in companies if c not in apply_income_statement_rows._cache]
     if not todo:
         return {}
@@ -1340,15 +1341,23 @@ def prefetch_income_statements(companies, max_workers=PDF_PARSE_MAX_WORKERS):
 
     errors = {}
     with ThreadPoolExecutor(max_workers=min(max_workers, len(todo))) as pool:
-        for company, result, error in pool.map(one, todo):
+        futures = [pool.submit(one, c) for c in todo]
+        # as_completed, not pool.map: map yields in submission order, so a
+        # company that finished early would not be reported until every
+        # company queued ahead of it had also finished - which is what made
+        # the progress UI look like it updated all at once at the end.
+        for fut in as_completed(futures):
+            company, result, error = fut.result()
             apply_income_statement_rows._cache[company] = result
             if error:
                 errors[company] = error
                 print(f"  ! {company}: skipped - {error}")
+            if on_company_done is not None:
+                on_company_done(company)
     return errors
 
 
-def prefetch_gemini_metrics(companies):
+def prefetch_gemini_metrics(companies, on_company_done=None):
     """Stage 3's model calls for ALL companies, issued concurrently under one
     shared concurrency gate, instead of company-by-company then batch-by-batch.
 
@@ -1361,7 +1370,8 @@ def prefetch_gemini_metrics(companies):
           f"({n_batches * len(jobs)} calls, up to "
           f"{gemini_extract.MAX_CONCURRENT_GEMINI} concurrent)...")
     results = asyncio.run(gemini_extract.extract_many_companies_async(
-        jobs, specs, all_forms=gemini_extract.ALL_FORMS))
+        jobs, specs, all_forms=gemini_extract.ALL_FORMS,
+        on_company_done=on_company_done))
     apply_company_gemini_pipeline._raw_cache.update(
         {c: r for c, r in results.items() if r})
     return results

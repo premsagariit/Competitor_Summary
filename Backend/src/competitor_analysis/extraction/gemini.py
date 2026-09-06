@@ -610,7 +610,8 @@ async def extract_company_metrics_async(company, pdf_path, metric_specs,
 
 
 async def extract_many_companies_async(jobs, metric_specs, batch_size=DEFAULT_BATCH_SIZE,
-                                       all_forms=None, max_concurrency=None, rpm=None):
+                                       all_forms=None, max_concurrency=None, rpm=None,
+                                       on_company_done=None):
     """Extract for several companies at once, with EVERY (company, batch) call
     sharing ONE concurrency gate.
 
@@ -637,6 +638,11 @@ async def extract_many_companies_async(jobs, metric_specs, batch_size=DEFAULT_BA
         except Exception as e:
             print(f"  ! Gemini extraction failed for {company_key}: {e}")
             return company_key, {}
+        finally:
+            # Reported as each company lands rather than after the gather, so
+            # a caller driving a progress UI sees them finish one by one.
+            if on_company_done is not None:
+                on_company_done(company_key)
 
     pairs = await asyncio.gather(*[one(*job) for job in jobs])
     return dict(pairs)

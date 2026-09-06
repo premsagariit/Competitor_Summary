@@ -28,10 +28,20 @@ from competitor_analysis.extraction import gemini as gemini_extract
 from competitor_analysis.extraction import data_engine as p
 
 
-def run_phase2(ws, companies=None, run_gic=True):
+def run_phase2(ws, companies=None, run_gic=True, on_progress=None):
     """Runs Phase 2's 4 stages against an already-loaded worksheet. Does NOT
-    load/save the workbook - callers own that."""
+    load/save the workbook - callers own that.
+
+    `on_progress(key, percent, status)`, if given, is called as each unit of
+    per-company work lands, so a caller driving a UI can show real movement
+    instead of everything jumping to 100% at the end. `key` is a company key
+    or "GIC". The three milestones are weighted by how long each actually
+    takes: the PDF parse dominates, so it carries most of the bar."""
     t_start = time.time()
+
+    def progress(key, percent, status=None):
+        if on_progress is not None:
+            on_progress(key, percent, status)
     per_company = defaultdict(dict)  # company -> {"income_statement": s, "gemini": s}
 
     # ---- Stage 0: label the value columns for the period being run ----
@@ -49,8 +59,10 @@ def run_phase2(ws, companies=None, run_gic=True):
         gic_updated, gic_skipped = p.apply_gic_rows(ws, lookups)
         t_gic = time.time() - t0
         print(f"[GIC.xlsx]        {gic_updated} rows written, {len(gic_skipped)} unmatched  -  {t_gic:.1f}s")
+        progress("GIC", 100, "done")
     else:
         print("[GIC.xlsx]        skipped - not found for this period.")
+        progress("GIC", 0, "skipped")
 
     if companies is None:
         companies = list(gemini_extract.COMPANY_PDFS.keys())
@@ -60,7 +72,8 @@ def run_phase2(ws, companies=None, run_gic=True):
     # the sheet writes below stay sequential.
     t0 = time.time()
     print(f"[Income Statement] extracting {len(companies)} companies concurrently ...")
-    mem_skipped = p.prefetch_income_statements(companies)
+    mem_skipped = p.prefetch_income_statements(
+        companies, on_company_done=lambda c: progress(c, 60, "extracting"))
     t_inc_extract = time.time() - t0
     if mem_skipped:
         # Not fatal by design: the container's memory budget was reached
@@ -85,7 +98,8 @@ def run_phase2(ws, companies=None, run_gic=True):
     # concurrency gate; the per-company loop below then only converts and
     # writes, which is fast and must stay serial (openpyxl isn't thread-safe).
     t0 = time.time()
-    p.prefetch_gemini_metrics(companies)
+    p.prefetch_gemini_metrics(
+        companies, on_company_done=lambda c: progress(c, 85, "extracting"))
     t_fetch = time.time() - t0
     hits, misses = gemini_extract.CACHE_STATS["hit"], gemini_extract.CACHE_STATS["miss"]
     print(f"[Gemini]          extraction done  -  {t_fetch:.1f}s total "
@@ -95,6 +109,7 @@ def run_phase2(ws, companies=None, run_gic=True):
         t0 = time.time()
         written, log, raw = p.apply_company_gemini_pipeline(ws, company)
         per_company[company]["gemini"] = time.time() - t0
+        progress(company, 100, "done")
         not_found = sum(1 for v in raw.values() if not v["found"])
         print(f"[Gemini]          {company}: wrote {written} cell-pairs, {not_found}/{len(raw)} not found  -  "
               f"{per_company[company]['gemini']:.1f}s")

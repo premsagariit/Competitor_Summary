@@ -54,9 +54,6 @@ class CompanyState:
     size: int | None = None
     extraction_status: str = "queued"
     extraction_progress: int = 0
-    metrics_done: int = 0
-    metrics_total: int = 0
-    cache_hits: int = 0
 
 
 @dataclass
@@ -457,10 +454,6 @@ def _phase_extraction(run: RunState):
         else:
             cs.extraction_status = "skipped"
 
-    metrics_total = len(gemini.master_metric_specs())
-    for cs in run.companies.values():
-        cs.metrics_total = metrics_total
-
     gemini.CACHE_STATS.update(hit=0, miss=0)
 
     wb, ws = p.load_engine(cfg.DATA_ENGINE_TEMPLATE
@@ -481,7 +474,20 @@ def _phase_extraction(run: RunState):
         run.log("warn", f"Present on disk but not registered for extraction: "
                         f"{', '.join(missing_from_cache)}")
 
-    pipeline_mod.run_phase2(ws, companies=runnable, run_gic=gic_available and gic_selected)
+    def _on_progress(key, percent, status=None):
+        """Reflect one unit of per-company work onto the run snapshot the
+        dashboard polls. Without this the whole table sat at its starting
+        value until run_phase2 returned, then jumped to 100% at once."""
+        cs = run.companies.get(_company_id(key))
+        if cs is None:
+            return
+        cs.extraction_progress = max(cs.extraction_progress, int(percent))
+        if status:
+            cs.extraction_status = status
+
+    pipeline_mod.run_phase2(ws, companies=runnable,
+                            run_gic=gic_available and gic_selected,
+                            on_progress=_on_progress)
 
     engine_path = cfg.data_engine_output_path()
     paths.ensure_parent(engine_path)
@@ -489,13 +495,12 @@ def _phase_extraction(run: RunState):
     run.data_engine_path = str(engine_path)
     run.log("success", f"Data Engine written to {engine_path}")
 
-    hits = gemini.CACHE_STATS.get("hit", 0)
+    # Anything still mid-flight had no progress callback fire for it (a
+    # company skipped inside run_phase2, say) - settle it here.
     for cs in run.companies.values():
         if cs.extraction_status == "extracting":
             cs.extraction_status = "done"
             cs.extraction_progress = 100
-            cs.metrics_done = metrics_total
-            cs.cache_hits = hits // max(len(runnable), 1)
     run.set_phase("extraction", "done")
 
 

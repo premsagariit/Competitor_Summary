@@ -136,4 +136,12 @@ export const API = {
     if (!runId) throw new ApiError("No run selected.", 0, null);
     window.open(API.reportUrl(runId), "_blank", "noopener");
   },
+
+  /** The filled Data Engine workbook for this run. Served from the same
+   * artifacts/output/ directory that gets synced to R2, so it survives an
+   * instance restart in production. */
+  downloadDataEngine(runId) {
+    if (!runId) throw new ApiError("No run selected.", 0, null);
+    window.open(API.dataEngineUrl(runId), "_blank", "noopener");
+  },
 };

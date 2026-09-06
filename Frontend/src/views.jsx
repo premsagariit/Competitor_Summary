@@ -264,13 +264,29 @@ export function RetrievalView({ state, onRetry, onView, onDelete, onUpload, onCo
 // ---------------------------------------------------------------------------
 // Extraction (Phase 2)
 // ---------------------------------------------------------------------------
-export function ExtractionView({ state }) {
+export function ExtractionView({ state, onDownloadDataEngine }) {
   return (
     <Card className="p-5">
-      <div className="flex items-center justify-between mb-5">
+      <div className="flex items-start justify-between gap-4 mb-5">
         <div>
           <h2 className="text-lg font-semibold text-white">Data Extraction</h2>
           <p className="text-sm text-slate-400 mt-0.5">Gemini-batched line-item extraction into the Data Engine workbook</p>
+        </div>
+        <div className="flex flex-col items-end shrink-0">
+          <Button
+            variant={state.dataEngineReady ? "primary" : "ghost"}
+            disabled={!state.dataEngineReady}
+            onClick={onDownloadDataEngine}
+            title={state.dataEngineReady
+              ? "Download the filled Data Engine workbook for this run"
+              : "Available once extraction has written the workbook"}
+          >
+            <AppIcon name="download" className="w-4 h-4" />
+            Data Engine
+          </Button>
+          <span className="text-[11px] text-slate-600 mt-1.5">
+            {state.dataEngineReady ? `.xlsx · run ${state.runId}` : "Ready after extraction"}
+          </span>
         </div>
       </div>
       <div className="overflow-x-auto scrollbar-thin">
@@ -279,8 +295,6 @@ export function ExtractionView({ state }) {
             <tr className="text-left text-slate-500 text-xs uppercase tracking-wide border-b border-slate-800">
               <th className="py-2.5 pr-4 font-medium">Company</th>
               <th className="py-2.5 pr-4 font-medium">Progress</th>
-              <th className="py-2.5 pr-4 font-medium">Metrics</th>
-              <th className="py-2.5 pr-4 font-medium">Cache hits</th>
               <th className="py-2.5 pr-4 font-medium">Status</th>
             </tr>
           </thead>
@@ -295,11 +309,9 @@ export function ExtractionView({ state }) {
                       <span className="text-slate-200">{company.short}</span>
                     </div>
                   </td>
-                  <td className="py-3 pr-4 w-48">
-                    <ProgressBar value={c.extraction.metricsTotal ? (c.extraction.metricsDone / c.extraction.metricsTotal) * 100 : 0} tone={c.extraction.status === "done" ? "emerald" : "brand"} />
+                  <td className="py-3 pr-4 w-64">
+                    <ProgressBar value={c.extraction.progress} tone={c.extraction.status === "done" ? "emerald" : "brand"} />
                   </td>
-                  <td className="py-3 pr-4 text-slate-400 tabular-nums">{c.extraction.metricsDone}/{c.extraction.metricsTotal}</td>
-                  <td className="py-3 pr-4 text-slate-400 tabular-nums">{c.extraction.cacheHits}</td>
                   <td className="py-3 pr-4">{statusBadge(c.extraction.status)}</td>
                 </tr>
               );

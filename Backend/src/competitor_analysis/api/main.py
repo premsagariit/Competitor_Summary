@@ -121,10 +121,7 @@ def _serialise_run(run) -> dict:
                               "progress": cs.retrieval_progress,
                               "tier": cs.tier, "size": cs.size},
                 "extraction": {"status": cs.extraction_status,
-                               "progress": cs.extraction_progress,
-                               "metricsDone": cs.metrics_done,
-                               "metricsTotal": cs.metrics_total,
-                               "cacheHits": cs.cache_hits},
+                               "progress": cs.extraction_progress},
             }
             for cid, cs in run.companies.items()
         },

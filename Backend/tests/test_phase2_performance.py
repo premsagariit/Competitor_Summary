@@ -565,3 +565,65 @@ def test_a_heavy_filing_is_skipped_without_sinking_the_run(monkeypatch):
     # Light extracted normally; Heavy cached as empty so nothing re-parses it.
     assert p.apply_income_statement_rows._cache["Light"] == {"GWP": (1.0, 2.0)}
     assert p.apply_income_statement_rows._cache["Heavy"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Live per-company progress
+# ---------------------------------------------------------------------------
+
+def test_income_prefetch_reports_each_company_as_it_finishes(monkeypatch):
+    """Progress must be reported per company as work lands.
+
+    pool.map yields in SUBMISSION order, so a company that finished early was
+    not reported until everything queued ahead of it had finished too - which
+    is why the dashboard's bars all jumped at the end instead of moving.
+    """
+    import threading
+    from competitor_analysis.extraction import data_engine as p
+
+    monkeypatch.setattr(p, "COMPANY_PDFS",
+                        {"Slow": "s.pdf", "Fast": "f.pdf"}, raising=False)
+    monkeypatch.setattr(p.apply_income_statement_rows, "_cache", {}, raising=False)
+
+    started = threading.Event()
+
+    def fake_extract(company, path):
+        if company == "Slow":
+            started.set()
+            time.sleep(0.30)        # submitted first, finishes last
+        else:
+            started.wait(1.0)
+            time.sleep(0.02)
+        return {"GWP": (1.0, 2.0)}
+
+    monkeypatch.setattr(p, "extract_income_statement", fake_extract)
+
+    order = []
+    p.prefetch_income_statements(["Slow", "Fast"], max_workers=2,
+                                 on_company_done=order.append)
+
+    assert order == ["Fast", "Slow"], (
+        "completion order, not submission order - got " + repr(order))
+
+
+def test_gemini_prefetch_reports_each_company(monkeypatch):
+    """Stage 3's callback fires once per company, including one that failed,
+    so a company erroring out cannot leave its bar stuck forever."""
+    done = []
+
+    # First positional is the PROMPT NAME (the company's full name), not the
+    # short key the results are returned under.
+    async def fake_one(prompt_name, pdf_path, specs, batch_size, all_forms,
+                       semaphore, limiter):
+        if prompt_name == "B Ltd":
+            raise RuntimeError("model refused")
+        return {"m0": {"found": True}}
+
+    monkeypatch.setattr(g, "extract_company_metrics_async", fake_one)
+
+    jobs = [("A", "A Ltd", "a.pdf"), ("Broken", "B Ltd", "b.pdf")]
+    results = asyncio.run(g.extract_many_companies_async(
+        jobs, SPECS[:1], rpm=0, on_company_done=done.append))
+
+    assert sorted(done) == ["A", "Broken"]
+    assert results["Broken"] == {}          # failed, but still reported

@@ -48,7 +48,7 @@ function idleCompanies(companyList) {
   companyList.forEach((c) => {
     obj[c.id] = {
       retrieval: { status: "queued", progress: 0, tier: null, size: null },
-      extraction: { status: "queued", progress: 0, metricsDone: 0, metricsTotal: 0, cacheHits: 0 },
+      extraction: { status: "queued", progress: 0 },
     };
   });
   return obj;
@@ -79,6 +79,7 @@ export default function App() {
   ]);
   const [reportProgress, setReportProgress] = useState(0);
   const [reportReady, setReportReady] = useState(false);
+  const [dataEngineReady, setDataEngineReady] = useState(false);
   const [elapsed, setElapsed] = useState(0);
 
   const pollTimer = useRef(null);
@@ -143,6 +144,7 @@ export default function App() {
     setCompanies(snap.companies);
     setReportProgress(snap.reportProgress);
     setReportReady(snap.reportReady);
+    setDataEngineReady(snap.dataEngineReady);
     setElapsed(Math.round(snap.elapsed));
     setRunStatus(snap.status);
     // The backend owns the activity feed - it is the pipeline's own stdout,
@@ -327,6 +329,15 @@ export default function App() {
     API.downloadReport(runId);
   }
 
+  function downloadDataEngine() {
+    if (!dataEngineReady) {
+      toast({ kind: "info", title: "Not ready",
+              description: "Extraction hasn't produced a Data Engine workbook for this run yet." });
+      return;
+    }
+    API.downloadDataEngine(runId);
+  }
+
   const companyMeta = Object.fromEntries(companyList.map((c) => [c.id, c]));
   const reportingDone = phases.find((p) => p.key === "reporting")?.status === "done";
   const reportSections = REPORT_SECTIONS.map((name) => ({
@@ -340,6 +351,7 @@ export default function App() {
   const state = {
     fy, quarter, phases, companies, activity, running, runStatus, elapsed,
     reportProgress, reportSections, companyMeta, runId, reportReady,
+    dataEngineReady,
     selectedPeriod, backend, companyList, selectedCompanies,
   };
 
@@ -539,7 +551,7 @@ export default function App() {
               onContinue={continueToBuild}
             />
           )}
-          {view === "extraction" && <ExtractionView state={state} />}
+          {view === "extraction" && <ExtractionView state={state} onDownloadDataEngine={downloadDataEngine} />}
           {view === "reporting" && <ReportsView state={state} onDownload={downloadReport} />}
         </main>
       </div>

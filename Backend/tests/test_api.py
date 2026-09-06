@@ -161,8 +161,10 @@ def test_status_payload_has_every_field_the_dashboard_reads(stub_pipeline):
         assert key in body, f"missing {key}"
     company = next(iter(body["companies"].values()))
     assert set(company["retrieval"]) == {"status", "progress", "tier", "size"}
-    assert set(company["extraction"]) == {"status", "progress", "metricsDone",
-                                          "metricsTotal", "cacheHits"}
+    # The dashboard's extraction table shows a live progress bar and a status
+    # badge only - the per-company metric count and cache-hit count were
+    # dropped from both the UI and this payload.
+    assert set(company["extraction"]) == {"status", "progress"}
 
 
 def test_a_failing_phase_marks_the_run_failed(monkeypatch):
