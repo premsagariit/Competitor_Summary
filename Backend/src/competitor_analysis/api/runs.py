@@ -131,7 +131,8 @@ def _classify(line: str) -> str:
     if any(t in low for t in ("giving up", "failed", "error", "traceback")):
         return "error"
     if any(t in low for t in (" ! ", "rejected", "discarded", "skipped",
-                              "rate-limited", "not found", "unmatched")):
+                              "rate-limited", "not found", "unmatched",
+                              "abandoned", "memory budget")):
         return "warn"
     if any(t in low for t in ("saved", "done", "complete", "wrote")):
         return "success"

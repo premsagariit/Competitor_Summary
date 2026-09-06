@@ -60,8 +60,17 @@ def run_phase2(ws, companies=None, run_gic=True):
     # the sheet writes below stay sequential.
     t0 = time.time()
     print(f"[Income Statement] extracting {len(companies)} companies concurrently ...")
-    p.prefetch_income_statements(companies)
+    mem_skipped = p.prefetch_income_statements(companies)
     t_inc_extract = time.time() - t0
+    if mem_skipped:
+        # Not fatal by design: the container's memory budget was reached
+        # while parsing these filings, so they were abandoned to keep the
+        # process alive. Say so loudly - their rows will read as
+        # not-found, which otherwise looks like missing source data.
+        print(f"[Memory]          {len(mem_skipped)} filing(s) abandoned to stay within the "
+              f"memory budget: {', '.join(sorted(mem_skipped))}")
+        for company, reason in sorted(mem_skipped.items()):
+            print(f"[Memory]            {company}: {reason}")
     for company in companies:
         per_company[company]["income_statement"] = t_inc_extract / max(len(companies), 1)
     print(f"[Income Statement] extraction done  -  {t_inc_extract:.1f}s total")

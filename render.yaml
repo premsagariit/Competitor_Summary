@@ -35,3 +35,11 @@ services:
         value: "2"
       - key: GEMINI_MAX_CONCURRENCY
         value: "3"
+      # Soft ceiling. A filing heavy enough to approach the 512MB hard cap
+      # is abandoned with a warning and the run continues without it,
+      # instead of the kernel SIGKILLing the container mid-run. Deliberately
+      # ~110MB under the cap: the check fires between pages, so RSS
+      # overshoots the budget before the document is released (measured at
+      # ~50MB). A normal run peaks at 317MB, so this should never fire.
+      - key: MEMORY_BUDGET_MB
+        value: "400"

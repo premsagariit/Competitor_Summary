@@ -479,3 +479,89 @@ def test_parse_releases_each_page_cache(monkeypatch):
     assert len(doc["pages"]) == 5
     assert doc["pages"][0]["forms_detected"] == ["NL-1"]
     assert doc["pages"][0]["tables"] == [[["a", "b"]]]
+
+
+# ---------------------------------------------------------------------------
+# Memory budget: degrade one filing, never kill the process
+# ---------------------------------------------------------------------------
+
+def test_memory_budget_is_off_unless_configured(monkeypatch):
+    """A dev machine or CI box must never have work abandoned under it."""
+    from competitor_analysis import memory
+    monkeypatch.delenv("MEMORY_BUDGET_MB", raising=False)
+    assert memory.budget_mb() == 0
+    memory.check("anything")  # must not raise, whatever RSS happens to be
+
+
+def test_memory_check_raises_once_over_budget(monkeypatch):
+    from competitor_analysis import memory
+    monkeypatch.setenv("MEMORY_BUDGET_MB", "100")
+    monkeypatch.setattr(memory, "rss_mb", lambda: 99.0)
+    memory.check("under")                       # no raise
+    monkeypatch.setattr(memory, "rss_mb", lambda: 100.0)
+    with pytest.raises(memory.MemoryBudgetExceeded, match="memory budget reached"):
+        memory.check("Star Health (parsing page 18/51)")
+
+
+def test_unreadable_rss_never_blocks_a_run(monkeypatch):
+    """rss_mb() returning None means 'no opinion' - a platform without a
+    probe must not have every document abandoned under it."""
+    from competitor_analysis import memory
+    monkeypatch.setenv("MEMORY_BUDGET_MB", "1")
+    monkeypatch.setattr(memory, "rss_mb", lambda: None)
+    memory.check("no probe available")          # must not raise
+
+
+def test_parse_aborts_the_document_between_pages(monkeypatch):
+    """The checkpoint has to fire where the half-built result can still be
+    dropped - between pages, not mid-write."""
+    from competitor_analysis import memory
+    from competitor_analysis.extraction import pdf_cache
+
+    seen = []
+
+    class FakePage:
+        def __init__(self, n): self.n = n
+        def extract_text(self): return f"page {self.n}"
+        def extract_tables(self): return []
+        def close(self): seen.append(self.n)
+
+    class FakePdf:
+        pages = [FakePage(i) for i in range(10)]
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(pdf_cache.pdfplumber, "open", lambda p: FakePdf())
+    monkeypatch.setenv("MEMORY_BUDGET_MB", "100")
+    # Cross the budget partway through the document.
+    rss = iter([10.0] * 3 + [999.0] * 20)
+    monkeypatch.setattr(memory, "rss_mb", lambda: next(rss))
+
+    with pytest.raises(memory.MemoryBudgetExceeded, match="parsing page 4/10"):
+        pdf_cache.parse_pdf_to_json("x.pdf", "HeavyCo")
+    assert seen == [0, 1, 2, 3], "should stop at the page that crossed the budget"
+
+
+def test_a_heavy_filing_is_skipped_without_sinking_the_run(monkeypatch):
+    """The whole point: one filing over budget costs that filing, not the
+    process. The others still extract, and the skip is reported."""
+    from competitor_analysis import memory
+    from competitor_analysis.extraction import data_engine as p
+
+    monkeypatch.setattr(p, "COMPANY_PDFS", {"Heavy": "h.pdf", "Light": "l.pdf"}, raising=False)
+    monkeypatch.setattr(p.apply_income_statement_rows, "_cache", {}, raising=False)
+
+    def fake_extract(company, path):
+        if company == "Heavy":
+            raise memory.MemoryBudgetExceeded("Heavy (parsing page 9/60): memory budget reached")
+        return {"GWP": (1.0, 2.0)}
+
+    monkeypatch.setattr(p, "extract_income_statement", fake_extract)
+
+    errors = p.prefetch_income_statements(["Heavy", "Light"], max_workers=1)
+
+    assert set(errors) == {"Heavy"}
+    assert "memory budget reached" in errors["Heavy"]
+    # Light extracted normally; Heavy cached as empty so nothing re-parses it.
+    assert p.apply_income_statement_rows._cache["Light"] == {"GWP": (1.0, 2.0)}
+    assert p.apply_income_statement_rows._cache["Heavy"] == {}

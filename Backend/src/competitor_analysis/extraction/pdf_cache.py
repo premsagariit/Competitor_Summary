@@ -20,6 +20,7 @@ import re
 import pdfplumber
 
 from competitor_analysis import config as cfg
+from competitor_analysis import memory
 from competitor_analysis import paths
 
 CACHE_ROOT = str(paths.PDF_JSON_CACHE)
@@ -167,6 +168,10 @@ def parse_pdf_to_json(pdf_path, company):
             # 1.5MB filing retained 560MB). close() only drops those caches -
             # the page re-parses on demand if a caller needs it again.
             page.close()
+            # Between pages is the safe place to give up: pages_out and the
+            # document can both be dropped and collected. Raising here costs
+            # this one filing instead of the whole container.
+            memory.check(f"{company} (parsing page {i + 1}/{len(pdf.pages)})")
     stat = os.stat(pdf_path)
     return {
         "company": company,

@@ -19,6 +19,7 @@ convention exists, not as something re-verifiable in-tree.
 """
 import asyncio
 import argparse
+import gc
 import json
 import math
 import os
@@ -34,6 +35,7 @@ from competitor_analysis.extraction.forms import (COMPANY_PDFS, get_form_page, g
 from competitor_analysis.extraction import gemini as gemini_extract
 from competitor_analysis.extraction import schemas
 from competitor_analysis import config as cfg
+from competitor_analysis import memory
 from competitor_analysis import paths
 
 XLSX_PATH = str(paths.DATA_ENGINE_WORKBOOK)
@@ -1323,12 +1325,26 @@ def prefetch_income_statements(companies, max_workers=PDF_PARSE_MAX_WORKERS):
     todo = [c for c in companies if c not in apply_income_statement_rows._cache]
     if not todo:
         return {}
+
     def one(company):
-        return company, extract_income_statement(company, COMPANY_PDFS[company])
+        try:
+            return company, extract_income_statement(company, COMPANY_PDFS[company]), None
+        except memory.MemoryBudgetExceeded as e:
+            # This filing is too heavy to parse within the container's
+            # budget. Give up on it rather than on the process: an empty
+            # result caches as "nothing extracted", so the sheet-writing
+            # stage skips its rows with a reason instead of re-parsing and
+            # hitting the same wall.
+            gc.collect()
+            return company, {}, str(e)
+
     errors = {}
     with ThreadPoolExecutor(max_workers=min(max_workers, len(todo))) as pool:
-        for company, result in pool.map(one, todo):
+        for company, result, error in pool.map(one, todo):
             apply_income_statement_rows._cache[company] = result
+            if error:
+                errors[company] = error
+                print(f"  ! {company}: skipped - {error}")
     return errors
 
 
