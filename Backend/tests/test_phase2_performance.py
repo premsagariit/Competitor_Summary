@@ -469,8 +469,8 @@ def test_parse_releases_each_page_cache(monkeypatch):
         def __exit__(self, *a): return False
 
     monkeypatch.setattr(pdf_cache.pdfplumber, "open", lambda p: FakePdf())
-    monkeypatch.setattr(pdf_cache.os, "stat",
-                        lambda p: type("S", (), {"st_mtime": 1.0, "st_size": 2})())
+    # The parse fingerprints the source file; there isn't one here.
+    monkeypatch.setattr(pdf_cache, "_content_fingerprint", lambda p: ("deadbeef", 2))
 
     doc = pdf_cache.parse_pdf_to_json("ignored.pdf", "TestCo")
 
@@ -627,3 +627,71 @@ def test_gemini_prefetch_reports_each_company(monkeypatch):
 
     assert sorted(done) == ["A", "Broken"]
     assert results["Broken"] == {}          # failed, but still reported
+
+
+# ---------------------------------------------------------------------------
+# The PDF-parse cache is persisted; the Gemini response cache is not
+# ---------------------------------------------------------------------------
+
+def test_pdf_cache_survives_an_mtime_change(tmp_path, monkeypatch):
+    """The cache must key on CONTENT, not mtime.
+
+    It is synced to R2 and restored onto a fresh container, and a download
+    rewrites mtime to "now" even when the bytes are identical. Keyed on
+    mtime, the restored cache was discarded on first use and everything
+    re-parsed - which would have made the whole sync pointless."""
+    import os
+    from competitor_analysis.extraction import pdf_cache
+
+    pdf = tmp_path / "filing.pdf"
+    pdf.write_bytes(b"%PDF-1.4\nsome bytes\n")
+    monkeypatch.setattr(pdf_cache, "CACHE_ROOT", str(tmp_path / "cache"))
+
+    parses = []
+
+    def counting_parse(path, company):
+        parses.append(company)
+        return {"company": company, "source_path": str(path),
+                "source_file": os.path.basename(path),
+                **dict(zip(("pdf_sha256", "pdf_size"),
+                           pdf_cache._content_fingerprint(path))),
+                "pages": []}
+
+    monkeypatch.setattr(pdf_cache, "parse_pdf_to_json", counting_parse)
+
+    pdf_cache.get_company_json(str(pdf), "TestCo")
+    assert parses == ["TestCo"]
+
+    os.utime(pdf, (1, 1))                      # what an R2 restore looks like
+    pdf_cache.get_company_json(str(pdf), "TestCo")
+    assert parses == ["TestCo"], "mtime change must not invalidate the cache"
+
+    pdf.write_bytes(b"%PDF-1.4\nDIFFERENT bytes\n")   # a replaced filing
+    pdf_cache.get_company_json(str(pdf), "TestCo")
+    assert parses == ["TestCo", "TestCo"], "changed content must re-parse"
+
+
+def test_r2_sync_covers_pdf_json_but_never_gemini(monkeypatch):
+    """The Gemini cache must never be persisted.
+
+    Those are model answers, not derived facts: restoring them would serve
+    an analyst the same wrong extraction after they re-ran to correct it.
+    The PDF cache is deterministic, so persisting it cannot change an
+    answer - only the time it takes to get one."""
+    from competitor_analysis import paths
+    from competitor_analysis.storage import r2
+
+    uploaded, downloaded = [], []
+    monkeypatch.setattr(r2, "upload_tree", lambda d: uploaded.append(str(d)))
+    monkeypatch.setattr(r2, "download_tree", lambda p: downloaded.append(str(p)))
+
+    r2.sync_run_outputs()
+    r2.restore_all()
+
+    up, down = " ".join(uploaded), " ".join(downloaded)
+    assert "pdf_json" in up and "pdf_json" in down
+    assert "gemini" not in up.lower(), f"Gemini cache must not be uploaded: {uploaded}"
+    assert "gemini" not in down.lower(), f"Gemini cache must not be restored: {downloaded}"
+    # Scoped to the pdf_json subdirectory, not the cache root - syncing
+    # CACHE_DIR would drag the Gemini cache along with it.
+    assert str(paths.CACHE_DIR) not in uploaded

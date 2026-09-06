@@ -3,7 +3,18 @@
 Render's free tier has no persistent disk - it's wiped on every deploy and
 every idle spin-down. Everything under data/downloads/ and artifacts/output/
 would vanish without this, since those are the actual retrieved filings and
-generated reports (paths.py), not regenerable cache.
+generated reports (paths.py).
+
+The PDF-parse cache (artifacts/cache/pdf_json/) is synced too, purely as a
+speed measure: re-deriving it took ~1000s of every production run. It is
+safe to persist because it is DETERMINISTIC - the same PDF always yields
+byte-identical JSON - so a restored entry can never change an extracted
+answer, and it self-invalidates on the source PDF's content hash.
+
+artifacts/cache/gemini/ is deliberately NOT synced. Those are model
+answers, not derived facts: if an analyst spots a wrong extraction and
+re-runs, a restored response cache would serve the same wrong answer
+straight back. Re-running must re-ask the model. Do not add it here.
 
 R2 is S3-compatible, so this is a thin boto3 wrapper rather than a bespoke
 client. Credentials are optional: if the R2_* env vars aren't set, every
@@ -110,6 +121,8 @@ def restore_all() -> None:
     """Call once at API startup, before serving requests."""
     download_tree("data/downloads")
     download_tree("artifacts/output")
+    # pdf_json only - never artifacts/cache/gemini (see module docstring).
+    download_tree("artifacts/cache/pdf_json")
 
 
 def sync_run_outputs() -> None:
@@ -117,3 +130,8 @@ def sync_run_outputs() -> None:
     review) so whatever it produced survives the next container restart."""
     upload_tree(paths.DOWNLOADS_DIR)
     upload_tree(paths.OUTPUT_DIR)
+    # Uploaded even on a failed run: the parse cache is valid regardless of
+    # whether the stages after it succeeded, and re-deriving it is the
+    # single most expensive thing a fresh container does. Scoped to
+    # PDF_JSON_CACHE, never CACHE_DIR, to keep the Gemini cache local.
+    upload_tree(paths.PDF_JSON_CACHE)

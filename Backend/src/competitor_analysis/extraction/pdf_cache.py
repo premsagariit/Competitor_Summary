@@ -13,6 +13,7 @@ extraction) and forms.py (deterministic line-item lookups) both source
 their pages from here instead of each independently re-opening/re-scanning
 the PDF.
 """
+import hashlib
 import json
 import os
 import re
@@ -139,6 +140,23 @@ def _cache_path(company):
     return os.path.join(CACHE_ROOT, cfg.FY, cfg.QUARTER, f"{safe}.json")
 
 
+def _content_fingerprint(pdf_path):
+    """(sha256, size) of the source PDF - the cache's validity key.
+
+    Deliberately NOT mtime. The cache is synced to R2 and restored onto a
+    fresh container, and a download rewrites mtime to "now" even when the
+    bytes are identical - so an mtime key discarded the restored cache
+    immediately and re-parsed everything, defeating the sync. Content
+    hashing costs ~21ms on the largest filing against ~56s to re-parse it,
+    and it is strictly more correct: an edited filing that happens to keep
+    its byte count is now a miss, where size+mtime could call it a hit."""
+    h = hashlib.sha256()
+    with open(pdf_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest(), os.path.getsize(pdf_path)
+
+
 def parse_pdf_to_json(pdf_path, company):
     """One pdfplumber pass: every page's number, detected form(s), tables and
     raw text - both tables and text are stored (not just whichever exists)
@@ -172,28 +190,31 @@ def parse_pdf_to_json(pdf_path, company):
             # document can both be dropped and collected. Raising here costs
             # this one filing instead of the whole container.
             memory.check(f"{company} (parsing page {i + 1}/{len(pdf.pages)})")
-    stat = os.stat(pdf_path)
+    sha, size = _content_fingerprint(pdf_path)
     return {
         "company": company,
         "source_path": pdf_path,
         "source_file": os.path.basename(pdf_path),
-        "pdf_mtime": stat.st_mtime,
-        "pdf_size": stat.st_size,
+        "pdf_sha256": sha,
+        "pdf_size": size,
         "pages": pages_out,
     }
 
 
 def get_company_json(pdf_path, company=None, force_refresh=False):
-    """Cache hit iff the cached file's stored mtime+size match the current
-    PDF; otherwise (re)parses and overwrites."""
+    """Cache hit iff the cached file's stored content hash+size match the
+    current PDF; otherwise (re)parses and overwrites.
+
+    An entry written before this keyed on mtime and carries no pdf_sha256,
+    so it misses once and is rewritten - no migration needed."""
     company = _company_for_path(pdf_path, company)
-    stat = os.stat(pdf_path)
     cache_path = _cache_path(company)
     if not force_refresh and os.path.exists(cache_path):
         try:
             with open(cache_path, "r", encoding="utf-8") as f:
                 cached = json.load(f)
-            if cached.get("pdf_mtime") == stat.st_mtime and cached.get("pdf_size") == stat.st_size:
+            sha, size = _content_fingerprint(pdf_path)
+            if cached.get("pdf_sha256") == sha and cached.get("pdf_size") == size:
                 return cached
         except (json.JSONDecodeError, OSError):
             pass
