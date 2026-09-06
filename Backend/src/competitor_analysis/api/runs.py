@@ -73,6 +73,7 @@ class RunState:
     activity: list = field(default_factory=list)
     stages: tuple = ("download", "build")
     selected_companies: frozenset | None = None
+    prewarm: threading.Thread | None = field(default=None, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def log(self, level: str, text: str):
@@ -271,6 +272,11 @@ def _execute(run: RunState, stages: tuple):
             # pipeline stops here so a human can confirm the retrieved
             # documents (or replace/remove/upload one) before extraction
             # reads them.
+            # Started BEFORE the status flips: a client that sees
+            # awaiting_review may POST /continue immediately, and
+            # _phase_extraction has to be able to see this thread in order to
+            # join it rather than parse the same filings alongside it.
+            _start_parse_prewarm(run)
             run.status = "awaiting_review"
             run.log("info", "Documents retrieved. Review them, then continue "
                             "to extraction.")
@@ -405,6 +411,56 @@ def _phase_retrieval(run: RunState):
                         f"The build continues with whatever landed.")
 
 
+def _start_parse_prewarm(run: RunState):
+    """Parse the retrieved filings while a human reviews them.
+
+    A run pauses at awaiting_review for as long as it takes someone to look
+    at eight PDFs, and nothing uses the CPU during that. Parsing is by far
+    the most expensive thing the pipeline does - 998s of a 1193s production
+    run - and it depends only on the files already on disk, so it can happen
+    in that dead time instead of after the reviewer clicks Continue.
+
+    Purely an optimisation, never a correctness step: it only populates the
+    same on-disk cache extraction would have populated itself, and
+    _phase_extraction joins this thread before reading it. If the reviewer
+    replaces a filing, the cache keys on file CONTENT, so the stale entry is
+    ignored and that one file is re-parsed - which is what makes doing this
+    speculatively safe at all.
+    """
+    from competitor_analysis.extraction import pdf_cache
+
+    def work():
+        pdf_cache.refresh_company_pdfs()
+        targets = dict(pdf_cache.COMPANY_PDFS)
+        if run.selected_companies is not None:
+            targets = {k: v for k, v in targets.items()
+                       if _company_id(k) in run.selected_companies}
+        if not targets:
+            return
+        done = 0
+        for company, path in targets.items():
+            if run.status not in ("awaiting_review", "running"):
+                return  # cancelled or failed while we were working
+            try:
+                pdf_cache.get_company_json(path, company)
+                done += 1
+            except Exception as e:
+                # Never surface as a run failure: extraction will simply
+                # parse this one itself, and report properly if it can't.
+                run.log("info", f"Pre-parse skipped {company}: {e}")
+        if done:
+            run.log("info", f"Pre-parsed {done} filing(s) while awaiting review "
+                            f"- extraction will reuse them.")
+
+    t = threading.Thread(target=work, name=f"prewarm-{run.run_id}", daemon=True)
+    # Started BEFORE being published, so nothing can observe an unstarted
+    # thread and try to join it. Correctness does not rest on the join in
+    # any case - pdf_cache locks per company, so a racing extraction waits
+    # for this thread's parse rather than duplicating it.
+    t.start()
+    run.prewarm = t
+
+
 # ---------------------------------------------------------------------------
 # Phase 2: extraction
 # ---------------------------------------------------------------------------
@@ -466,6 +522,15 @@ def _phase_extraction(run: RunState):
     # run for a different period, and Phase 1 downloads land after
     # set_period. Without it, extraction reads whichever period's PDFs were
     # on disk when the module was first imported.
+    # Wait for any prewarm started at the review pause. It shares the cache
+    # this stage is about to read, and pdf_cache locks per company, so
+    # joining avoids two threads parsing the same filing - the most
+    # expensive way to waste a 0.1-CPU container. If review was instant this
+    # returns almost immediately and the work simply happens below instead.
+    if run.prewarm is not None and run.prewarm.is_alive():
+        run.log("info", "Waiting for the pre-parse started during review ...")
+        run.prewarm.join()
+
     from competitor_analysis.extraction import pdf_cache
     pdf_cache.refresh_company_pdfs()
     runnable = [k for k in short_keys if k in pdf_cache.COMPANY_PDFS]

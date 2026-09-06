@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 
 import pdfplumber
 
@@ -201,6 +202,36 @@ def parse_pdf_to_json(pdf_path, company):
     }
 
 
+# One lock per company. The cache now has two writers - extraction, and the
+# prewarm that runs during the review pause - and parsing the same filing
+# twice is the most expensive possible way to waste a 0.1-CPU container.
+# Whichever thread gets here first parses; the other waits and then reads
+# what it produced.
+_parse_locks = {}
+_parse_locks_guard = threading.Lock()
+
+
+def _parse_lock(company):
+    with _parse_locks_guard:
+        return _parse_locks.setdefault(company, threading.Lock())
+
+
+def _read_cached(cache_path, pdf_path):
+    """The cached parse if it is still valid for this PDF's contents, else
+    None."""
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            cached = json.load(f)
+        sha, size = _content_fingerprint(pdf_path)
+        if cached.get("pdf_sha256") == sha and cached.get("pdf_size") == size:
+            return cached
+    except (json.JSONDecodeError, OSError):
+        pass
+    return None
+
+
 def get_company_json(pdf_path, company=None, force_refresh=False):
     """Cache hit iff the cached file's stored content hash+size match the
     current PDF; otherwise (re)parses and overwrites.
@@ -209,20 +240,28 @@ def get_company_json(pdf_path, company=None, force_refresh=False):
     so it misses once and is rewritten - no migration needed."""
     company = _company_for_path(pdf_path, company)
     cache_path = _cache_path(company)
-    if not force_refresh and os.path.exists(cache_path):
-        try:
-            with open(cache_path, "r", encoding="utf-8") as f:
-                cached = json.load(f)
-            sha, size = _content_fingerprint(pdf_path)
-            if cached.get("pdf_sha256") == sha and cached.get("pdf_size") == size:
+    if not force_refresh:
+        cached = _read_cached(cache_path, pdf_path)
+        if cached is not None:
+            return cached
+    with _parse_lock(company):
+        # Re-check under the lock: another thread may have parsed this exact
+        # filing while we waited, and re-parsing it would double the single
+        # most expensive operation in the pipeline.
+        if not force_refresh:
+            cached = _read_cached(cache_path, pdf_path)
+            if cached is not None:
                 return cached
-        except (json.JSONDecodeError, OSError):
-            pass
-    doc = parse_pdf_to_json(pdf_path, company)
-    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-    with open(cache_path, "w", encoding="utf-8") as f:
-        json.dump(doc, f, ensure_ascii=False, default=str)
-    return doc
+        doc = parse_pdf_to_json(pdf_path, company)
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        # Written via a temp file and renamed, so a reader never sees a
+        # half-written cache entry - os.replace is atomic on both POSIX and
+        # Windows.
+        tmp = f"{cache_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(doc, f, ensure_ascii=False, default=str)
+        os.replace(tmp, cache_path)
+        return doc
 
 
 def pages_for_form(doc_json, form_key, max_pages=None):

@@ -6,6 +6,8 @@ itself stubbed out - the point is the contract the dashboard consumes
 
 Run:  myenv/Scripts/python.exe -m pytest tests/test_api.py -v
 """
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -19,10 +21,20 @@ client = TestClient(app)
 @pytest.fixture(autouse=True)
 def _clean_registry():
     """Each test gets an empty run registry, so a leftover 'active' run from
-    a previous test can't make the next one fail with 409."""
+    a previous test can't make the next one fail with 409.
+
+    Also stops any parse-prewarm thread a run started at its review pause.
+    Those are daemons that outlive the test that spawned them, and they call
+    into pdf_cache - so without this they keep running against the NEXT
+    test's monkeypatched module and pollute its assertions."""
     runs_mod.REGISTRY._runs.clear()
     runs_mod.REGISTRY._active = None
     yield
+    for run in list(runs_mod.REGISTRY._runs.values()):
+        t = getattr(run, "prewarm", None)
+        if t is not None and t.is_alive():
+            run.status = "cancelled"      # the worker checks this per company
+            t.join(timeout=10)
 
 
 # ---------------------------------------------------------------------------
@@ -385,3 +397,68 @@ def test_view_delete_upload_on_unknown_run_is_404(downloads):
     r = client.post("/api/downloads/nope/nbhi/file",
                     files={"file": ("x.pdf", b"data", "application/pdf")})
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Parse prewarm during the review pause
+# ---------------------------------------------------------------------------
+
+def test_prewarm_parses_during_the_review_pause(monkeypatch, tmp_path):
+    """Parsing is 998s of a 1193s production run and depends only on files
+    already on disk, so it happens while a human reviews them rather than
+    after they click Continue."""
+    from competitor_analysis.extraction import pdf_cache
+
+    parsed = []
+    # Stub DISCOVERY, not COMPANY_PDFS: cfg.set_period fires the period
+    # listener registered at import, and refresh_company_pdfs resolves
+    # COMPANY_PDFS as a module global at call time - so it would repopulate
+    # a replaced dict with the real seven right back.
+    monkeypatch.setattr(pdf_cache, "discover_company_pdfs",
+                        lambda *a, **k: {"NBHI": "a.pdf", "Star Health": "b.pdf"})
+    pdf_cache.refresh_company_pdfs()
+    monkeypatch.setattr(pdf_cache, "get_company_json",
+                        lambda p, c=None, **k: parsed.append(c) or {"pages": []})
+    monkeypatch.setattr(runs_mod, "_phase_retrieval", lambda run: None)
+
+    r = client.post("/api/pipeline/run",
+                    json={"fy": "FY25-26", "quarter": "Q3", "stages": ["download"]})
+    run_id = r.json()["runId"]
+    run = runs_mod.REGISTRY.get(run_id)
+    for _ in range(200):
+        if run.status == "awaiting_review" and run.prewarm is not None:
+            break
+        time.sleep(0.02)
+    assert run.status == "awaiting_review"
+    run.prewarm.join(timeout=5)
+
+    assert sorted(parsed) == ["NBHI", "Star Health"], (
+        f"both filings should have been pre-parsed, got {parsed}")
+
+
+def test_prewarm_failure_never_fails_the_run(monkeypatch):
+    """Speculative work must not be able to break a run: extraction can
+    always parse the file itself and report properly if it cannot."""
+    from competitor_analysis.extraction import pdf_cache
+
+    monkeypatch.setattr(pdf_cache, "discover_company_pdfs",
+                        lambda *a, **k: {"NBHI": "gone.pdf"})
+    pdf_cache.refresh_company_pdfs()
+
+    def boom(path, company=None, **k):
+        raise OSError("file vanished mid-review")
+
+    monkeypatch.setattr(pdf_cache, "get_company_json", boom)
+    monkeypatch.setattr(runs_mod, "_phase_retrieval", lambda run: None)
+
+    r = client.post("/api/pipeline/run",
+                    json={"fy": "FY25-26", "quarter": "Q3", "stages": ["download"]})
+    run = runs_mod.REGISTRY.get(r.json()["runId"])
+    for _ in range(200):
+        if run.status == "awaiting_review" and run.prewarm is not None:
+            break
+        time.sleep(0.02)
+    run.prewarm.join(timeout=5)
+
+    assert run.status == "awaiting_review", "a prewarm error must not fail the run"
+    assert run.error is None
