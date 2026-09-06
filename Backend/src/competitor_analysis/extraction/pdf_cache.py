@@ -64,7 +64,15 @@ FORM_PATTERNS = {
     "NL-7": ("Operating Expenses Schedule (NL-7)", r"FORM\s+NL-7"),
     "NL-12": ("Investment Schedule (NL-12 & 12A)", r"FORM\s+NL-12"),
     "NL-20": ("Analytical Ratios Schedule (NL-20)", r"FORM\s+NL-20"),
-    "NL-29": ("Detail Regarding Debt Securities (NL-29)", r"FORM\s+NL-29"),
+    # Care Health's filing heads this schedule "NL-29 DETAILS REGARDING DEBT
+    # SECURITIES" with no "FORM" prefix, so a FORM-anchored pattern missed the
+    # page entirely and all 10 debt rating/maturity fields came back not-found.
+    # "FORM" is optional here, but the match must start a LINE: index/contents
+    # pages list every schedule mid-line ("30 NL-29-DEBT SECURITIES ..."), and
+    # an unanchored optional-FORM pattern matches those too - on Star Health
+    # that index (page 2) precedes the real page 35, so get_form_page's
+    # pages[:1] would have read the index instead. See KNOWN_ISSUES.md.
+    "NL-29": ("Detail Regarding Debt Securities (NL-29)", r"(?m)^\s*(?:FORM\s+)?NL-29(?!\d)"),
     "NL-31": ("Statement of Investment and Income on Investment (NL-31)", r"FORM\s+NL-31"),
     "NL-33": ("Reinsurance/Retrocession Risk Concentration (NL-33)", r"FORM\s+NL-33"),
     "NL-34": ("Geographical Distribution of Business (NL-34)", r"FORM\s+NL-34"),
