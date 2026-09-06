@@ -157,21 +157,40 @@ silently dropping or "correcting" them. The evidence/notes audit trail
 ## Appendix — closed findings, not open follow-ups
 
 These four are **pre-existing pipeline behavior noticed while verifying
-this refactor, already investigated and explained during this session** -
-distinct from sections 1-2 above, which remain open with a fix scoped. None
-of these four has a fix pending: three were traced to a specific, understood
-cause (a page-detection gap, a model-reasoning limit on a non-standard
-layout, a genuinely missing input document) and concluded not-a-bug; the
-fourth documents a working mechanism, not a gap - see below. Kept here only
-so a future reader doesn't mistake the underlying gap for a new problem, or
-rediscover an undocumented mechanism the hard way, or re-run the same
-investigation. Strike if not wanted.
+this refactor** - distinct from sections 1-2 above, which are the refactor's
+own findings. As of 2026-09-06:
 
-**Care Health / NL-29 — zero pages detected.** `pdf_cache` finds *no* page
-matching the NL-29 pattern in this company's PDF, so the payload is empty
-before Gemini sees it, and all 10 `debt_rating_*` / `debt_maturity_*` fields
-correctly return `found=False`. Stage 1 page-detection question, not an
-extraction fault.
+- **Care Health / NL-29** was initially recorded here as an explained
+  page-detection gap. Re-diagnosed later and found to be a real, fixable
+  bug - now fixed (`2806ae7`). Kept for the diagnosis and the regression
+  trap in the obvious fix.
+- **Narayana Health / NL-6** and **NL-41 prior-year** remain explained, with
+  no fix pending: one is a model-reasoning limit on a non-standard layout,
+  the other a genuinely missing input document.
+- **NL-29 maturity-bucket swap** documents a working mechanism, not a gap.
+
+Worth noting the Care Health entry's history as a caution: it was recorded
+here as "investigated, explained, not-a-bug" and turned out to be wrong as
+soon as someone actually grepped the page text for the form number. An
+explanation recorded here is not proof; re-check before relying on one to
+rule out a fix.
+
+**Care Health / NL-29 — zero pages detected. [FIXED in `2806ae7`]** `pdf_cache`
+found *no* page matching the NL-29 pattern in this company's PDF, so the
+payload was empty before Gemini saw it, and all 10 `debt_rating_*` /
+`debt_maturity_*` fields returned `found=False`. Diagnosed 2026-09-06: the
+form was **present all along** on page 37, headed `NL-29 DETAILS REGARDING
+DEBT SECURITIES` — no `FORM` prefix, which every registry pattern required.
+Fixed by making `FORM` optional *and line-anchored*
+(`r"(?m)^\s*(?:FORM\s+)?NL-29(?!\d)"`); the anchor matters, because an
+unanchored optional-`FORM` pattern also matches contents pages that list
+schedules mid-line (Star Health's page 2 lists 42 of them as
+`30 NL-29-DEBT SECURITIES ...`), and that page precedes its real page 35, so
+`get_form_page`'s `pages[:1]` would have read the index instead. Post-fix,
+all 7 companies detect 16/16 forms and Care Health returns 10/10 NL-29
+fields matching the source page's Book Value "% of total" column exactly.
+Audited at the same time: this was the **only** company/form combination in
+the registry with zero detected pages.
 
 **Narayana Health / NL-6 — page found, channels unparsed.** The NL-6 page
 *is* found and has a table, but Gemini's own reasoning over the raw
