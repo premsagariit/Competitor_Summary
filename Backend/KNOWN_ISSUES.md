@@ -120,11 +120,30 @@ sheet.
 | Narayana Health | **913.0** | 166.0 |
 | Galaxy Health | **2144.74** | 190.01 |
 
-A combined ratio that high implies paying out 9–20× premium in claims plus
-expenses. Both passed validation without complaint; no retry was triggered.
+> **CORRECTION (2026-09-06): these two values are almost certainly CORRECT,
+> not errors.** They were originally recorded here as "implausible" on the
+> reasoning that no real insurer pays out 9–20× premium. That reasoning
+> applied mature-insurer intuition to two companies that are not mature.
+> Checked against the filings' own registration lines: **Narayana Health
+> registered with IRDAI 03-Jan-2024** and **Galaxy Health 20-Mar-2024** —
+> both are startups, and every other insurer here dates from 2006-2016.
+> Their prior-year comparative (nine months to Dec 2024) therefore covers
+> their first months of operation. Prior-year GWP: Narayana **₹0.65 Cr**,
+> Galaxy **₹2.38 Cr**, against ₹4,684 Cr (NBHI) and ₹11,603 Cr (Star Health).
+> Startup fixed costs over a near-zero premium base produce ratios of exactly
+> this magnitude arithmetically. Narayana's `1.66 / 9.13` bare-decimal pair
+> also means the prompt's ×100 normalization did the *right* thing.
+>
+> This makes the case against a naive magnitude gate **stronger, not weaker**:
+> a threshold tuned to reject 913% would have discarded correct data from two
+> real insurers. §2's original reasoning anticipated this ("young insurers
+> genuinely do post combined ratios above 200%"); there is now hard evidence
+> for it. The structural gap below is still real - nothing checks magnitude -
+> but it currently has **no known instance of an actually-wrong value**, which
+> should lower its priority accordingly.
 
-**The two causes are different — this distinction was expensive to establish,
-so don't re-litigate it as one bug:**
+**The two values arise differently — this distinction was expensive to
+establish, so don't re-litigate it as one thing:**
 
 - **Narayana Health** — the source cell is a bare decimal pair, `1.66` /
   `9.13`, with no `%` sign. `PROMPT_TEMPLATE`'s own normalization rule ("no %
@@ -135,9 +154,11 @@ so don't re-litigate it as one bug:**
   hallucination.
 - **Galaxy Health** — the source cell already prints `190.01%` and
   `2144.74%` with explicit `%` signs, so no multiplication heuristic was
-  applied at all; the model read what was extracted. Distinguishing a genuine
-  extreme figure from a table-extraction artifact requires checking the
-  actual PDF page (NL-20, page 24).
+  applied at all; the model read what was printed. The open question here was
+  whether that printed figure was genuine or a table-extraction artifact -
+  **resolved: genuine.** Galaxy registered 20-Mar-2024 and its prior-year GWP
+  was ₹2.38 Cr, so a 21× combined ratio is what its own first-months numbers
+  actually produce.
 
 **Consumer:** `combined_ratio` (`gemini.py:200`) targets Slides 19 and 28.
 
