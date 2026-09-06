@@ -1,17 +1,23 @@
 # Known issues — logged, deliberately not fixed
 
-One **open** finding (section 2) and one **fixed** finding (section 1, kept
-for its evidence and reasoning) from refactoring Phase 2 Stage 3 extraction
-to Pydantic schemas (commits `2b4ff61`..`e391238`). Neither was *introduced*
-by that refactor — both are pre-existing pipeline behavior — but both were
-diagnosed and confirmed against real data before either was acted on.
+Two **open** findings (sections 2 and 3) and one **fixed** finding (section
+1, kept for its evidence and reasoning). Sections 1-2 came out of
+refactoring Phase 2 Stage 3 extraction to Pydantic schemas (commits
+`2b4ff61`..`e391238`); section 3 came out of checking, against a real Q4
+filing, whether the pipeline handles a future quarter. None was *introduced*
+by that work — all are pre-existing pipeline behavior — but all were
+diagnosed and confirmed against real data before being acted on.
 
-An appendix below covers three *closed* findings from the same session -
-already investigated and explained, not open follow-ups. Keep the three
-categories separate: section 1 is "here's a bug, here's what fixed it";
-section 2 is "here's a bug, here's the fix shape, not yet applied"; the
-appendix is "here's why this isn't a bug," kept only so it doesn't get
-mistaken for a new problem or re-investigated later.
+An appendix below covers four *closed* findings - already investigated and
+explained, not open follow-ups. Keep the three categories separate:
+section 1 is "here's a bug, here's what fixed it"; sections 2-3 are "here's
+a bug, here's the fix shape, not yet applied"; the appendix is "here's why
+this isn't a bug," kept only so it doesn't get mistaken for a new problem
+or re-investigated later.
+
+Two appendix entries have now had to be corrected after being written up as
+explained-and-not-a-bug (Care Health / NL-29, Narayana / NL-6). Treat an
+explanation here as a lead, not a verdict.
 
 ---
 
@@ -175,19 +181,62 @@ silently dropping or "correcting" them. The evidence/notes audit trail
 
 ---
 
+## 3. A form spilling onto a third page is silently truncated
+
+**Where:** `gemini.py:92`, `build_company_payload(pdf_path, form_keys,
+max_pages_per_form=2)` → `pdf_cache.pages_for_form(doc, key, max_pages=2)`,
+which slices with no warning.
+
+**Not currently losing anything** — no form in FY25-26 Q3 exceeds two pages.
+The concern is forward-looking: twelve company/form combinations already sit
+at *exactly* the cap, so one added row in a future filing crosses it.
+
+| form | companies at 2 pages (FY25-26 Q3) |
+|---|---|
+| NL-20 | NBHI, ABHI, Care Health, Star Health, Galaxy Health |
+| NL-34 | ABHI, Star Health, Galaxy Health |
+| NL-7  | Star Health, Galaxy Health |
+| NL-37 | ABHI |
+| NL-1  | Galaxy Health |
+
+**Why it would be silent.** Continuation pages *do* repeat their form header
+(verified on all twelve — e.g. Star Health's NL-20 pages 25 and 26 both open
+`FORM NL-20-ANALYTICAL RATIOS SCHEUDLE`), so a third page would be detected
+correctly and *then* dropped by the slice. The metrics on it come back
+`found=False`, which is indistinguishable from data the filing genuinely
+does not contain — the same confusion that made Care Health's NL-29 gap
+(appendix) look explained for as long as it did.
+
+**Why deliberately not fixed here:** the options trade off against each
+other and the choice is not obvious. Warning on truncation is free and
+makes the failure visible but still loses the data. Raising the cap costs
+tokens on every affected call and enlarges the response schema, which
+`DEFAULT_BATCH_SIZE`'s comment records as already near an API limit.
+Routing an over-cap form to the `awaiting_review` gate is the most
+consistent with how `table_markdown.py` treats unresolved columns, but
+blocks a run on something that may be harmless.
+
+**Minimum worth doing:** whichever option is chosen, `build_company_payload`
+should not drop pages without saying so.
+
+---
+
 ## Appendix — closed findings, not open follow-ups
 
 These four are **pre-existing pipeline behavior noticed while verifying
-this refactor** - distinct from sections 1-2 above, which are the refactor's
-own findings. As of 2026-09-06:
+the Pydantic refactor** - distinct from sections 1-3 above, which are open
+or fixed defects. As of 2026-09-06:
 
 - **Care Health / NL-29** was initially recorded here as an explained
   page-detection gap. Re-diagnosed later and found to be a real, fixable
   bug - now fixed (`2806ae7`). Kept for the diagnosis and the regression
   trap in the obvious fix.
-- **Narayana Health / NL-6** and **NL-41 prior-year** remain explained, with
-  no fix pending: one is a model-reasoning limit on a non-standard layout,
-  the other a genuinely missing input document.
+- **Narayana Health / NL-6** was recorded here as a model-reasoning limit.
+  That was a misdiagnosis, corrected 2026-09-06: the channel break-up
+  section is simply absent from the filing, so the extraction is already
+  correct. Second entry in this appendix to have been written up wrong.
+- **NL-41 prior-year** remains explained, with no fix pending: a genuinely
+  missing input document.
 - **NL-29 maturity-bucket swap** documents a working mechanism, not a gap.
 
 Worth noting the Care Health entry's history as a caution: it was recorded
@@ -213,15 +262,36 @@ fields matching the source page's Book Value "% of total" column exactly.
 Audited at the same time: this was the **only** company/form combination in
 the registry with zero detected pages.
 
-**Narayana Health / NL-6 — page found, channels unparsed.** The NL-6 page
-*is* found and has a table, but Gemini's own reasoning over the raw
-`page.extract_tables()` output can't map it to per-channel commissions (all 9
-`commission_ch_*` return `found=False`; `ri_commission` succeeds). Note that
-`gemini.py`'s payload passes raw nested lists — none of `table_markdown.py`'s
-period/group column classification touches Gemini's input, that is a separate
-deterministic path. Consistent with this insurer's already-documented
-non-standard layout (its NL-2/NL-20 column ordering is flagged as swapped
-relative to every other filer, see `forms._text_period_columns`).
+**Narayana Health / NL-6 — the channel break-up is not in the filing.
+[CORRECTED 2026-09-06 — the earlier entry here was a misdiagnosis.]**
+
+This was previously recorded as "page found, channels unparsed", blaming
+Gemini's reasoning over raw `page.extract_tables()` output and suggesting
+`table_markdown.py`'s column classification as the fix shape. That was
+wrong, and it is the same failure the Care Health caution above warns
+about: an explanation was written down without anyone reading the page.
+
+Narayana's NL-6 schedule ends at `Net Commission`. It has **no
+"Break-up of the expenses (Gross) incurred to procure business" section at
+all** — no header, and zero channel labels anywhere on the page. Verified
+in both FY25-26 Q3 (page 7 of 46) and FY25-26 Q4 (page 7 of 55), so it is a
+consistent characteristic of this filer, not a one-quarter anomaly.
+
+All 6 other insurers do carry the section, and all 6 return 9/9
+`commission_ch_*` found. Gemini's own cached note for Narayana reads
+*"Channel breakdown not explicitly present in NL-6 commission schedule"*,
+and `ri_commission` succeeds at 6.67 from the same page — so the model read
+the page correctly and reported an absence. `found=False` x9 is the right
+answer, and there is nothing to fix.
+
+**It will self-heal if Narayana starts filing the section.** Nothing in the
+extraction path branches per company, the Gemini cache key hashes the
+payload and the period, and `pdf_cache` invalidates on the PDF's mtime+size
+— so a filing that adds the break-up produces a cache miss and a fresh call.
+
+Unrelated but worth recording, since the old entry pointed at it:
+`table_markdown.py` has **no caller and no test** anywhere in the repo. It
+is not a path that could have been "wired in" to fix this; it is dead code.
 
 **NL-41 FY25_Q3 is structurally unfillable from current inputs.** NL-41 is a
 point-in-time snapshot with no prior-year comparative column; the current
@@ -232,6 +302,22 @@ document this pipeline never downloads. This is a missing input document, not
 a bug: `gemini.py`'s prompt and the NL-41 annotations are correct as written.
 Recorded because this one already cost one investigation cycle after being
 mistaken for pipeline output.
+
+Re-confirmed on FY25-26 Q4 (Narayana, page 47): still a single `Number`
+column, plus an Employees/Intermediaries movement table whose backward
+column is again "beginning of the quarter". So this is a property of the
+form in every quarter, not of one filing.
+
+If it is ever built, the shape is: run the existing scraper against
+`cfg.prior_fy(FY)` with the same quarter into `downloads/{prior_fy}/{Q}/`,
+then source NL-41's prior-year fields from that second document.
+`scraper.main()` is already FY-parameterised and `cfg.prior_fy()` /
+`prior_period_*()` already exist, so the work is a second download set plus
+an extraction path that reads two periods — a Phase 1 scope expansion, not
+a bug fix. One partial shortcut worth knowing: in a **Q4** filing, row 1
+("No. of offices at the beginning of the year") is the prior FY's closing
+position, so the offices count alone is recoverable from the current
+document. That does not extend to the employee or intermediary counts.
 
 **NL-29 maturity-bucket swap — a working mechanism, not a gap.**
 `data_engine.py:1341-1359`, inside `apply_company_gemini_pipeline`. Predates
