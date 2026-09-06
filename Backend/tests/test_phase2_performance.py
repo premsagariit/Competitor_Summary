@@ -695,3 +695,132 @@ def test_r2_sync_covers_pdf_json_but_never_gemini(monkeypatch):
     # Scoped to the pdf_json subdirectory, not the cache root - syncing
     # CACHE_DIR would drag the Gemini cache along with it.
     assert str(paths.CACHE_DIR) not in uploaded
+
+
+# ---------------------------------------------------------------------------
+# Transient server errors (503) must be retried, not fatal
+# ---------------------------------------------------------------------------
+
+def _server_error(code, status, message="boom"):
+    """A real google-genai ServerError, so these tests exercise the same
+    .code/.status shape production raises rather than a hand-rolled string."""
+    from google.genai import errors
+    return errors.ServerError(
+        code, {"error": {"code": code, "status": status, "message": message}})
+
+
+def test_503_is_recognised_as_retryable():
+    """The production failure: 'high demand' 503s were not matched by
+    _is_rate_limit, so _call_with_retry re-raised on the first attempt
+    despite max_attempts=5."""
+    exc = _server_error(503, "UNAVAILABLE",
+                        "This model is currently experiencing high demand.")
+    assert g._is_retryable(exc)
+    assert not g._is_rate_limit(exc), "503 is not a quota condition"
+    for code, status in [(500, "INTERNAL"), (504, "DEADLINE_EXCEEDED"),
+                         (429, "RESOURCE_EXHAUSTED")]:
+        assert g._is_retryable(_server_error(code, status)), status
+
+
+def test_client_errors_are_not_retried():
+    """A malformed request repeats identically - retrying just burns quota."""
+    from google.genai import errors
+    bad = errors.ClientError(400, {"error": {"code": 400,
+                                             "status": "INVALID_ARGUMENT",
+                                             "message": "schema too large"}})
+    assert not g._is_retryable(bad)
+    assert not g._is_retryable(ValueError("something local went wrong"))
+    # Regression: a bare substring search treated this as a 503 and retried
+    # it four times over 75s. Only an actual API-shaped error qualifies.
+    assert not g._is_retryable(RuntimeError("model unavailable"))
+    assert not g._is_retryable(Exception("found 500 internal records"))
+
+
+def test_503_is_retried_then_succeeds(monkeypatch):
+    """End to end through _call_with_retry: a 503 then a success must yield
+    the metrics, not an exception."""
+    attempts = []
+
+    def flaky(company, payload, metric_specs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise _server_error(503, "UNAVAILABLE", "high demand")
+        return {m["key"]: {"fy26_q3": 1.0, "fy25_q3": 2.0, "found": True,
+                           "source_form": "NL-1", "page_number": 1,
+                           "evidence": "e", "notes": None}
+                for m in metric_specs}
+
+    async def no_sleep(d):
+        pass
+
+    monkeypatch.setattr(g, "extract_metrics_via_gemini", flaky)
+    monkeypatch.setattr(g, "_retry_delay_from", lambda e, a: 0.0)
+    monkeypatch.setattr(g.asyncio, "sleep", no_sleep)
+
+    out = asyncio.run(g._call_with_retry(
+        "ACME", PAYLOAD, SPECS[:3], g.RateLimiter(0)))
+
+    assert len(attempts) == 2, "503 was not retried"
+    assert len(out) == 3 and all(v["found"] for v in out.values())
+
+
+def test_overload_backs_off_harder_than_a_bare_exponential(monkeypatch):
+    """A 429 carries the server's own retryDelay; an overload does not, and
+    1s/2s/4s was far too short for the multi-minute spike seen in
+    production."""
+    slept = []
+
+    async def fake_sleep(d):
+        slept.append(d)
+
+    def always_503(company, payload, metric_specs):
+        raise _server_error(503, "UNAVAILABLE", "high demand")
+
+    monkeypatch.setattr(g, "extract_metrics_via_gemini", always_503)
+    monkeypatch.setattr(g.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(Exception):
+        asyncio.run(g._call_with_retry("ACME", PAYLOAD, SPECS[:2],
+                                       g.RateLimiter(0), max_attempts=4))
+
+    assert slept, "no backoff happened at all"
+    assert slept[0] >= 5.0, f"first backoff too short for an overload: {slept}"
+    assert all(d <= 60.0 for d in slept), f"backoff must stay capped: {slept}"
+
+
+def test_a_company_failing_in_the_write_loop_does_not_fail_the_run(monkeypatch):
+    """The exact production shape: prefetch returned nothing for a company,
+    the write loop re-fetched it, that call 503'd, and the unprotected call
+    discarded a completed 21-minute run. The run must survive with the
+    other companies' rows intact."""
+    import openpyxl
+    from competitor_analysis.extraction import data_engine as p
+    from competitor_analysis import pipeline as pipeline_mod
+
+    monkeypatch.setattr(p, "sync_period_headers", lambda ws: [])
+    monkeypatch.setattr(p, "prefetch_income_statements",
+                        lambda c, **k: {})
+    monkeypatch.setattr(p, "apply_income_statement_rows", lambda ws: (0, []))
+    monkeypatch.setattr(p, "prefetch_gemini_metrics", lambda c, **k: {})
+    monkeypatch.setattr(p, "fix_slide8_and_slide12", lambda ws: (0, []))
+    monkeypatch.setattr(p, "assert_channel_mix_sums", lambda ws: [])
+
+    written_for = []
+
+    def flaky_apply(ws, company, dry_run=False):
+        if company == "Doomed":
+            raise _server_error(503, "UNAVAILABLE", "high demand")
+        written_for.append(company)
+        return 78, [], {"m0": {"found": True}}
+
+    monkeypatch.setattr(p, "apply_company_gemini_pipeline", flaky_apply)
+
+    ws = openpyxl.Workbook().active
+    seen = []
+    # Must not raise.
+    pipeline_mod.run_phase2(ws, companies=["Fine", "Doomed", "AlsoFine"],
+                            run_gic=False,
+                            on_progress=lambda k, pct, st: seen.append((k, st)))
+
+    assert written_for == ["Fine", "AlsoFine"], "healthy companies must still write"
+    assert ("Doomed", "failed") in seen, "the failure must surface as a status"

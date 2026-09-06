@@ -515,8 +515,48 @@ def _is_rate_limit(exc):
     return "429" in text or "RESOURCE_EXHAUSTED" in text
 
 
+# Transient server-side conditions. 503 UNAVAILABLE ("this model is currently
+# experiencing high demand") is the one that matters in practice: it took down
+# a 21-minute production run, and the retry that the run's own fallback path
+# happened to make seconds later SUCCEEDED - so the failure was purely a
+# missing retry, not an unusable API.
+_RETRYABLE_CODES = frozenset({429, 500, 502, 503, 504})
+_RETRYABLE_STATUSES = ("RESOURCE_EXHAUSTED", "UNAVAILABLE", "INTERNAL",
+                       "DEADLINE_EXCEEDED")
+
+
+# The text fallback must match the SHAPE of an API error, not merely mention
+# a status word. A bare substring search retried RuntimeError("model
+# unavailable") four times over 75s - caught by
+# test_one_company_failing_does_not_sink_the_run suddenly taking that long.
+_RETRYABLE_TEXT_RE = re.compile(
+    r"'status':\s*'(?:" + "|".join(_RETRYABLE_STATUSES) + r")'"
+    r"|^\s*(?:429|500|502|503|504)\s+(?:" + "|".join(_RETRYABLE_STATUSES) + r")",
+    re.IGNORECASE)
+
+
+def _is_retryable(exc):
+    """Whether re-issuing the identical request could plausibly succeed.
+
+    Prefers google-genai's own structured fields (APIError carries .code and
+    .status) over string matching, and falls back to the message text only
+    for an error shaped like an API response that was wrapped or re-raised
+    and lost those attributes."""
+    status = getattr(exc, "status", None)
+    code = getattr(exc, "code", None)
+    if isinstance(status, str):
+        if status.upper() in _RETRYABLE_STATUSES:
+            return True
+        # Only trust a bare .code when .status is present too, i.e. this is
+        # an APIError rather than something unrelated carrying a .code.
+        if isinstance(code, int) and code in _RETRYABLE_CODES:
+            return True
+    return bool(_RETRYABLE_TEXT_RE.search(str(exc))) or _is_rate_limit(exc)
+
+
 async def _call_with_retry(company, payload, batch, limiter, max_attempts=5):
-    """One batch call: rate-limited, and retried on quota rejection.
+    """One batch call: rate-limited, and retried on quota rejection or a
+    transient server error.
 
     The cache is consulted BEFORE the limiter: a cached answer makes no request
     and so must not consume a slot in the per-minute budget. (Gating it first
@@ -556,10 +596,19 @@ async def _call_with_retry(company, payload, batch, limiter, max_attempts=5):
                 _write_cache_entry(_cache_path(_cache_key(company, payload, batch)), out)
             return out
         except Exception as e:
-            if not _is_rate_limit(e) or attempt == max_attempts - 1:
+            if not _is_retryable(e) or attempt == max_attempts - 1:
                 raise
             delay = _retry_delay_from(e, attempt)
-            print(f"  . {company}: rate-limited (429), retrying in {delay:.0f}s "
+            if _is_rate_limit(e):
+                reason = "rate-limited (429)"
+            else:
+                # A 429 arrives with the server's own retryDelay; an overload
+                # does not, and plain 2**attempt (1s, 2s, 4s...) is far too
+                # short - the production spike that killed a run persisted
+                # for minutes. Back off harder when the server is the problem.
+                delay = max(delay, min(60.0, 5.0 * 2 ** attempt))
+                reason = f"transient {getattr(e, 'status', None) or 'server error'}"
+            print(f"  . {company}: {reason}, retrying in {delay:.0f}s "
                   f"(attempt {attempt + 2}/{max_attempts})")
             await asyncio.sleep(delay)
 

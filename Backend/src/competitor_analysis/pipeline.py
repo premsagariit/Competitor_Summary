@@ -105,14 +105,32 @@ def run_phase2(ws, companies=None, run_gic=True, on_progress=None):
     print(f"[Gemini]          extraction done  -  {t_fetch:.1f}s total "
           f"({hits} cached, {misses} live call{'s' if misses != 1 else ''})")
 
+    failed = {}
     for company in companies:
         t0 = time.time()
-        written, log, raw = p.apply_company_gemini_pipeline(ws, company)
+        try:
+            written, log, raw = p.apply_company_gemini_pipeline(ws, company)
+        except Exception as e:
+            # One company must not sink the run. The prefetch above already
+            # isolates per company, but this loop re-fetches any company the
+            # prefetch got nothing for - and that call was unprotected, so a
+            # single transient 503 on the last company discarded a completed
+            # 21-minute run. Its rows stay unfilled, which is the honest
+            # outcome, and the run finishes with the other six intact.
+            per_company[company]["gemini"] = time.time() - t0
+            failed[company] = f"{type(e).__name__}: {e}"
+            progress(company, 100, "failed")
+            print(f"  ! {company}: extraction failed, leaving its rows unfilled - {e}")
+            continue
         per_company[company]["gemini"] = time.time() - t0
         progress(company, 100, "done")
         not_found = sum(1 for v in raw.values() if not v["found"])
         print(f"[Gemini]          {company}: wrote {written} cell-pairs, {not_found}/{len(raw)} not found  -  "
               f"{per_company[company]['gemini']:.1f}s")
+
+    if failed:
+        print(f"[Gemini]          {len(failed)} of {len(companies)} companies failed "
+              f"extraction entirely: {', '.join(sorted(failed))}")
 
     # ---- Stage 4: Slide 8/12 convention fixes (needs Stage 3's Slide 12 values already written) ----
     t0 = time.time()
