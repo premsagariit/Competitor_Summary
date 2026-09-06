@@ -89,13 +89,10 @@ def run_build(fy: str, quarter: str) -> dict:
     cfg.set_period(fy, quarter)
     fy, quarter = cfg.FY, cfg.QUARTER
 
-    # Deferred imports: these modules compute FY/Quarter-derived path
-    # constants (including which insurer PDFs exist on disk) at import time,
-    # so they must only be imported *after* cfg.set_period() has run and
-    # after any downloading/uploading has actually placed the files -
-    # otherwise pdf_cache.COMPANY_PDFS (and everything that imports it:
-    # pdf_extract, gemini_extract, data_engine) would be computed
-    # against an empty/stale downloads folder.
+    # Deferred imports. These modules' period-derived state now follows
+    # cfg.set_period() via its listener hook rather than freezing at import,
+    # so the ordering is no longer load-bearing for correctness - it is kept
+    # because importing them with no period configured still raises.
     from competitor_analysis.extraction import pdf_cache
     from competitor_analysis.extraction import data_engine as p
     from competitor_analysis import pipeline as run_full_pipeline

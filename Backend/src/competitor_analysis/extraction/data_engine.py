@@ -37,7 +37,6 @@ from competitor_analysis import config as cfg
 from competitor_analysis import paths
 
 XLSX_PATH = str(paths.DATA_ENGINE_WORKBOOK)
-GIC_PATH = cfg.gic_path()
 
 # pdfplumber (pdfminer.six underneath) holds a full page/character object
 # graph in memory per open document, and prefetch_income_statements() parses
@@ -60,9 +59,35 @@ PRIOR_PERIOD = cfg.prior_period_column()
 HEADERS = ["Slide #", "Category", "Company", "Meric 1", "Metric 2",
            "Source Tab", "Link to Source document", CUR_PERIOD, PRIOR_PERIOD,
            "Growth"]
+_CUR_IDX = HEADERS.index(CUR_PERIOD)
+_PRIOR_IDX = HEADERS.index(PRIOR_PERIOD)
 COL = {h: i + 1 for i, h in enumerate(HEADERS)}
 COL[CUR] = COL[CUR_PERIOD]
 COL[PRIOR] = COL[PRIOR_PERIOD]
+
+
+@cfg.on_period_change
+def _refresh_period_columns():
+    """Re-label the two value columns when the period changes.
+
+    Resolved once at import, these went stale in the long-lived API server
+    exactly like pdf_cache's PDF map did, and sync_period_headers - whose
+    whole job is stopping a run presenting its figures under the wrong
+    quarter's heading - was then defeated by its own stale input. The values
+    still landed in the right columns (COL is positional), so the symptom
+    was a Q4 workbook headed FY25-26_Q3.
+
+    HEADERS and COL are mutated in place, matching pdf_cache, so a future
+    `from ... import COL` cannot silently pin itself to one period."""
+    global CUR_PERIOD, PRIOR_PERIOD
+    CUR_PERIOD = cfg.cur_period_column()
+    PRIOR_PERIOD = cfg.prior_period_column()
+    HEADERS[_CUR_IDX] = CUR_PERIOD
+    HEADERS[_PRIOR_IDX] = PRIOR_PERIOD
+    COL.clear()
+    COL.update({h: i + 1 for i, h in enumerate(HEADERS)})
+    COL[CUR] = COL[CUR_PERIOD]
+    COL[PRIOR] = COL[PRIOR_PERIOD]
 
 
 def sync_period_headers(ws):
@@ -178,7 +203,11 @@ class GicData:
     """Parses GIC.xlsx 'Segmentwise Report' and 'Health Portfolio' sheets into
     lookup dicts of {label: {col_name: (current, previous)}}."""
 
-    def __init__(self, path=GIC_PATH):
+    def __init__(self, path=None):
+        # Resolved per call, not as a default argument: a default binds at
+        # def time, so the long-lived API server read the first run's
+        # quarter of GIC.xlsx for every later run.
+        path = path or cfg.gic_path()
         import openpyxl as ox
         wb = ox.load_workbook(path, data_only=True)
         self.segmentwise = self._parse_block_sheet(wb["Segmentwise Report"])

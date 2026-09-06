@@ -253,3 +253,55 @@ def test_reverse_lookup_drops_the_old_period(tmp_path, monkeypatch):
     assert q3_path != q4_path
     assert pdf_cache._company_for_path(q4_path) == "NBHI"
     assert os.path.normpath(q3_path) not in pdf_cache._PDF_TO_COMPANY
+
+
+def test_value_column_labels_follow_the_period():
+    """sync_period_headers exists to stop a run presenting its figures under
+    the wrong quarter's heading. Its labels were resolved once at import, so
+    in the long-lived API server it wrote the FIRST run's period onto every
+    later run's workbook - defeated by its own stale input."""
+    import openpyxl
+    from competitor_analysis.extraction import data_engine as p2
+
+    cfg.set_period("FY26-27", "Q1")
+    ws = openpyxl.Workbook().active
+    p2.sync_period_headers(ws)
+
+    assert ws.cell(row=1, column=p2.COL[p2.CUR]).value == "FY26-27_Q1"
+    assert ws.cell(row=1, column=p2.COL[p2.PRIOR]).value == "FY25-26_Q1"
+    # The positional invariant the workbook layout depends on must survive.
+    assert p2.HEADERS[7] == p2.CUR_PERIOD and p2.HEADERS[8] == p2.PRIOR_PERIOD
+    assert p2.COL[p2.CUR] == 8 and p2.COL[p2.PRIOR] == 9
+
+
+def test_gic_workbook_path_follows_the_period(tmp_path, monkeypatch):
+    """GIC_PATH was a DEFAULT ARGUMENT on GicData.__init__, bound at def
+    time, and pipeline.py constructs GicData() with no argument - so every
+    run after the first read the first run's quarter of GIC.xlsx."""
+    import openpyxl
+    from competitor_analysis import paths
+    from competitor_analysis.extraction import data_engine as p2
+
+    seen = {}
+
+    def _capture(path, **kw):
+        seen["path"] = path
+        raise RuntimeError("path captured")
+
+    monkeypatch.setattr(paths, "DOWNLOADS_DIR", tmp_path)
+    monkeypatch.setattr(openpyxl, "load_workbook", _capture)
+
+    cfg.set_period("FY25-26", "Q4")
+    with pytest.raises(RuntimeError, match="path captured"):
+        p2.GicData()
+    assert seen["path"] == cfg.gic_path()
+    assert "Q4" in seen["path"]
+
+
+def test_trends_footnote_names_the_configured_period():
+    from competitor_analysis.reporting import report
+
+    cfg.set_period("FY26-27", "Q1")
+    note = report._trends_note()
+    assert "FY25-26 Q1" in note and "FY26-27 Q1" in note
+    assert "Q3" not in note

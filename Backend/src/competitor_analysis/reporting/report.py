@@ -37,8 +37,6 @@ from competitor_analysis.reporting import data
 from competitor_analysis import config as cfg
 from competitor_analysis import paths
 
-OUT_PATH = cfg.output_pdf_path()
-
 NUMFMT_PCT = {"percent"}
 
 
@@ -701,7 +699,11 @@ def slide_26(pdf, rows):
 # Slides 27-31: Historical Trends (2-period comparison)
 # ---------------------------------------------------------------------------
 
-TRENDS_NOTE = f"Quarterly YoY comparison ({cfg.prior_period_label()} vs {cfg.cur_period_label()}), not multi-year history."
+def _trends_note():
+    """Resolved per call: as a module constant this froze the first run's
+    quarter into every later run's footnote in the long-lived API server."""
+    return (f"Quarterly YoY comparison ({cfg.prior_period_label()} vs "
+            f"{cfg.cur_period_label()}), not multi-year history.")
 
 
 def slide_27(pdf, rows):
@@ -709,7 +711,7 @@ def slide_27(pdf, rows):
         {"title": "GWP (Rs. Crore)", "metric1": "GWP", "metric2": None, "kind": "money"},
         {"title": "PBT (Rs. Crore)", "metric1": "PBT", "metric2": None, "kind": "money"},
     ]
-    metric_panels_page(pdf, rows, 27, "Historical Trends", 27, panels, footnote=TRENDS_NOTE)
+    metric_panels_page(pdf, rows, 27, "Historical Trends", 27, panels, footnote=_trends_note())
 
 
 def slide_28(pdf, rows):
@@ -719,7 +721,7 @@ def slide_28(pdf, rows):
         {"title": "Loss Ratio", "metric1": "Loss Ratio", "metric2": None, "kind": "percent",
          "higher_is_better": False},
     ]
-    metric_panels_page(pdf, rows, 28, "Historical Trends", 28, panels, footnote=TRENDS_NOTE)
+    metric_panels_page(pdf, rows, 28, "Historical Trends", 28, panels, footnote=_trends_note())
 
 
 def slide_29(pdf, rows):
@@ -729,7 +731,7 @@ def slide_29(pdf, rows):
         {"title": "Expense of Management Ratio", "metric1": "Expense of Management Ratio", "metric2": None,
          "kind": "percent", "higher_is_better": False},
     ]
-    metric_panels_page(pdf, rows, 29, "Historical Trends", 29, panels, footnote=TRENDS_NOTE)
+    metric_panels_page(pdf, rows, 29, "Historical Trends", 29, panels, footnote=_trends_note())
 
 
 def slide_30(pdf, rows):
@@ -739,7 +741,7 @@ def slide_30(pdf, rows):
         {"title": "RI Commission to RI Ceding", "metric1": "RI Commission to RI Ceding", "metric2": "Risk Ceded",
          "kind": "percent", "mode": "single"},
     ]
-    metric_panels_page(pdf, rows, 30, "Historical Trends", 30, panels, footnote=TRENDS_NOTE)
+    metric_panels_page(pdf, rows, 30, "Historical Trends", 30, panels, footnote=_trends_note())
 
 
 def slide_31(pdf, rows):
@@ -748,7 +750,7 @@ def slide_31(pdf, rows):
          "mode": "single"},
         {"title": "Solvency Ratio", "metric1": "Solvency Ratios", "metric2": None, "kind": "ratio"},
     ]
-    metric_panels_page(pdf, rows, 31, "Historical Trends", 31, panels, footnote=TRENDS_NOTE)
+    metric_panels_page(pdf, rows, 31, "Historical Trends", 31, panels, footnote=_trends_note())
 
 
 # ---------------------------------------------------------------------------
