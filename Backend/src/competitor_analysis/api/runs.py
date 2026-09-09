@@ -9,6 +9,12 @@ on disk, scraper.ATTEMPT_LOG, the Gemini cache counters, the extraction
 audit - never from a simulated timer. A status this API reports as "done"
 means the corresponding artifact exists.
 """
+# RunRegistry defines its own `list` method, which shadows the builtin for
+# any annotation written below it in the class body (e.g. `list[str]`
+# resolves to that method, not the builtin, and isn't subscriptable) -
+# deferred (string) annotations sidestep this entirely.
+from __future__ import annotations
+
 import io
 import threading
 import time
@@ -61,7 +67,7 @@ class RunState:
     run_id: str
     fy: str
     quarter: str
-    status: str = "queued"  # queued | running | awaiting_review | completed | failed | cancelled
+    status: str = "queued"  # queued | running | awaiting_review | awaiting_report | completed | failed | cancelled
     started_at: float = field(default_factory=time.time)
     finished_at: float | None = None
     error: str | None = None
@@ -160,11 +166,11 @@ class RunRegistry:
     def active_run_id(self) -> str | None:
         rid = self._active
         run = self._runs.get(rid) if rid else None
-        # A run paused for document review still owns the download directory
-        # and workbook a second run would write to, so it counts as active
-        # exactly like "running" does - and the frontend needs it here to
-        # reattach to a paused review after a page refresh.
-        if run and run.status in ("queued", "running", "awaiting_review"):
+        # A run paused for document or Data Engine review still owns the
+        # download directory and workbook a second run would write to, so it
+        # counts as active exactly like "running" does - and the frontend
+        # needs it here to reattach to a paused review after a page refresh.
+        if run and run.status in ("queued", "running", "awaiting_review", "awaiting_report"):
             return rid
         return None
 
@@ -192,10 +198,44 @@ class RunRegistry:
         thread.start()
         return run
 
+    def start_manual(self, fy: str, quarter: str, companies=None) -> RunState:
+        """Create a run that skips Phase 1 entirely, landing straight in
+        "awaiting_review" so the caller can upload every source's file by
+        hand before extraction runs at all - for a user who already has the
+        filings and would rather not pay for (or wait on) retrieval.
+
+        No thread is started here: unlike start()/continue_build(), there is
+        no pipeline stage to run yet. This reuses the exact same
+        "awaiting_review" state, company statuses and upload endpoints a
+        paused download-stage run already exposes, so the review screen (and
+        continue_build() to move on from it) needs no changes at all - every
+        company simply starts "missing" instead of some being "done"."""
+        with self._lock:
+            if self.active_run_id:
+                raise RuntimeError(
+                    f"A run is already in progress ({self.active_run_id}). "
+                    f"Wait for it to finish before starting another.")
+            run = _new_run(fy, quarter, stages=("build",), companies=companies)
+            self._runs[run.run_id] = run
+            self._active = run.run_id
+
+        for cs in run.companies.values():
+            if run.selected_companies is not None and cs.id not in run.selected_companies:
+                cs.retrieval_status, cs.retrieval_progress = "skipped", 0
+        run.set_phase("retrieval", "skipped")
+        _sync_retrieval_from_disk(run)
+        run.status = "awaiting_review"
+        run.log("info", f"Manual upload mode for {fy} {quarter}: retrieval skipped. "
+                        f"Upload each source's file, then continue to extraction.")
+        return run
+
     def continue_build(self, run_id: str) -> RunState:
         """Resume a run that paused after Phase 1 for document review, now
-        running Phases 2-3 against whatever is on disk - including anything a
-        reviewer replaced, removed or uploaded by hand since the pause.
+        running Phase 2 (extraction) against whatever is on disk - including
+        anything a reviewer replaced, removed or uploaded by hand since the
+        pause. Lands at "awaiting_report" once extraction finishes, so a human
+        can review the filled Data Engine workbook before Phase 3 reads it -
+        see continue_report() for that second pause's continuation.
 
         Reuses the same RunState (and run_id) rather than starting a second
         run, so the dashboard's review screen and the extraction/report
@@ -213,6 +253,51 @@ class RunRegistry:
 
         thread = threading.Thread(target=_execute, args=(run, ("build",)),
                                   name=f"run-{run_id}-build", daemon=True)
+        thread.start()
+        return run
+
+    def continue_report(self, run_id: str) -> RunState:
+        """Resume a run that paused after Phase 2 for Data Engine review, now
+        running Phase 3 (reporting) against whatever workbook is on disk -
+        including a replacement a reviewer uploaded by hand since the pause.
+
+        Reuses the same RunState (and run_id), same as continue_build()."""
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise KeyError(f"No such run: {run_id}")
+            if run.status not in ("awaiting_report", "failed"):
+                raise RuntimeError(
+                    f"Run {run_id} is not awaiting Data Engine review (status: {run.status}).")
+            run.stages = tuple(dict.fromkeys((*run.stages, "report")))
+            self._active = run.run_id
+
+        thread = threading.Thread(target=_execute, args=(run, ("report",)),
+                                  name=f"run-{run_id}-report", daemon=True)
+        thread.start()
+        return run
+
+    def fetch_missing(self, run_id: str, companies: list[str] | None = None) -> RunState:
+        """Fetch automatically whichever sources are still missing/failed on
+        a paused run - e.g. a manual-upload run's user uploaded some sources
+        by hand and wants the rest retrieved instead, or a normal run had one
+        source fail and the user wants just that one retried. Runs within
+        the same run (no new run_id); the run returns to awaiting_review
+        when it finishes, whatever the outcome.
+
+        `companies`, if given, restricts the fetch to that subset of company
+        ids; omitted means every currently missing/failed selected source."""
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise KeyError(f"No such run: {run_id}")
+            if run.status not in ("awaiting_review", "failed"):
+                raise RuntimeError(
+                    f"Run {run_id} is not awaiting review (status: {run.status}).")
+            self._active = run.run_id
+
+        thread = threading.Thread(target=_execute_fetch_missing, args=(run, companies),
+                                  name=f"run-{run_id}-fetch", daemon=True)
         thread.start()
         return run
 
@@ -237,11 +322,13 @@ def _new_run(fy: str, quarter: str, stages, companies=None) -> RunState:
 def _execute(run: RunState, stages: tuple):
     """Run the given stage(s) against `run`.
 
-    Called once from RunRegistry.start() with the run's initial stages, and
+    Called once from RunRegistry.start() with the run's initial stages,
     again from RunRegistry.continue_build() with just ("build",) once a human
-    has reviewed Phase 1's output - the two calls share one RunState, so a
-    paused-for-review run and its continuation are one run to the API and the
-    dashboard, not two.
+    has reviewed Phase 1's output, and again from RunRegistry.continue_report()
+    with just ("report",) once a human has reviewed Phase 2's Data Engine
+    workbook - all three calls share one RunState, so a run paused at either
+    review point and its continuation are one run to the API and the
+    dashboard, not several.
     """
     stream = _ActivityStream(run)
     run.status = "running"
@@ -263,10 +350,20 @@ def _execute(run: RunState, stages: tuple):
                 _sync_retrieval_from_disk(run)
             if "build" in stages:
                 _phase_extraction(run)
+            if "report" in stages:
                 _phase_reporting(run)
-        if "build" in stages:
+        if "report" in stages:
             run.status = "completed"
             run.log("success", "Run completed.")
+        elif "build" in stages:
+            # Deliberately not "completed" - extraction finished, but the
+            # pipeline stops here so a human can review the filled Data
+            # Engine workbook (download it, and replace it by hand if
+            # something looks wrong) before the report is built from it.
+            run.status = "awaiting_report"
+            run.log("info", "Data Engine ready. Review it (download it, "
+                            "replace it if needed), then continue to report "
+                            "generation.")
         else:
             # Deliberately not "completed" - Phase 1 finished, but the
             # pipeline stops here so a human can confirm the retrieved
@@ -300,13 +397,14 @@ def _execute(run: RunState, stages: tuple):
         run.log("error", traceback.format_exc(limit=6))
     finally:
         stream.flush()
-        # Not set on "awaiting_review": the run isn't over, it's paused, so
-        # elapsed keeps ticking (and a later continue can still fail/finish).
+        # Not set on "awaiting_review"/"awaiting_report": the run isn't over,
+        # it's paused, so elapsed keeps ticking (and a later continue can
+        # still fail/finish).
         if run.status in ("completed", "failed"):
             run.finished_at = time.time()
-        # Runs also pause at "awaiting_review" with real retrieved documents
-        # already on disk, so sync regardless of which of the three end
-        # states this run landed in.
+        # Runs also pause at "awaiting_review"/"awaiting_report" with real
+        # files already on disk, so sync regardless of which state this run
+        # landed in.
         r2.sync_run_outputs()
 
 
@@ -342,30 +440,29 @@ def _sync_retrieval_from_disk(run: RunState):
             except OSError:
                 pass
         elif cs.retrieval_status not in ("downloading", "retrying"):
-            cs.retrieval_status = "missing"
+            # Reset progress alongside status - otherwise a company an
+            # attempt already flipped to 100% (found/failed) but that wrote
+            # no file shows "Missing" next to a full progress bar.
+            cs.retrieval_status, cs.retrieval_progress = "missing", 0
 
 
-def _phase_retrieval(run: RunState):
+def _fetch_sources(run: RunState, target_keys: list[str] | None):
+    """Runs the scraper for `target_keys` (source_links.json keys) and
+    updates each targeted company's retrieval status as results land, then
+    syncs every company's status from disk once the scraper finishes.
+
+    Shared by the initial full download stage (`target_keys` = every
+    selected source) and a scoped re-fetch of just the sources still missing
+    on an already-paused run (`target_keys` = that subset) - the two only
+    differ in which keys they pass in, not in how a fetch is watched/applied.
+    Companies outside `target_keys` are left completely untouched here."""
     import asyncio
     from competitor_analysis.ingestion import scraper
 
-    run.set_phase("retrieval", "running")
-    run.log("info", "Phase 1: retrieving filings from disclosure portals.")
-    scraper.ATTEMPT_LOG.clear()
-
-    selected_keys = None
-    if run.selected_companies is not None:
-        by_id = {_company_id(key): key for key in scraper.load_sources()}
-        selected_keys = [by_id[i] for i in run.selected_companies if i in by_id]
-        skipped = [c.name for c in run.companies.values()
-                  if c.id not in run.selected_companies]
-        if skipped:
-            run.log("info", f"Excluded from this run: {', '.join(skipped)}.")
-
-    for cs in run.companies.values():
-        if run.selected_companies is not None and cs.id not in run.selected_companies:
-            cs.retrieval_status, cs.retrieval_progress = "skipped", 0
-        else:
+    watch_keys = set(target_keys)
+    for key in target_keys:
+        cs = run.companies.get(_company_id(key))
+        if cs is not None:
             cs.retrieval_status, cs.retrieval_progress = "downloading", 5
 
     stop = threading.Event()
@@ -375,6 +472,8 @@ def _phase_retrieval(run: RunState):
         each company resolves, instead of all flipping at the end."""
         while not stop.wait(1.0):
             for key, info in list(scraper.ATTEMPT_LOG.items()):
+                if key not in watch_keys:
+                    continue
                 cs = run.companies.get(_company_id(key))
                 if cs is None:
                     continue
@@ -388,12 +487,14 @@ def _phase_retrieval(run: RunState):
     watcher = threading.Thread(target=watch, daemon=True)
     watcher.start()
     try:
-        asyncio.run(scraper.main(run.fy, run.quarter, companies=selected_keys))
+        asyncio.run(scraper.main(run.fy, run.quarter, companies=target_keys))
     finally:
         stop.set()
         watcher.join(timeout=2)
 
     for key, info in scraper.ATTEMPT_LOG.items():
+        if key not in watch_keys:
+            continue
         cs = run.companies.get(_company_id(key))
         if cs is None:
             continue
@@ -403,12 +504,85 @@ def _phase_retrieval(run: RunState):
         cs.retrieval_progress = 100
     _sync_retrieval_from_disk(run)
 
+
+def _phase_retrieval(run: RunState):
+    from competitor_analysis.ingestion import scraper
+
+    run.set_phase("retrieval", "running")
+    run.log("info", "Phase 1: retrieving filings from disclosure portals.")
+    scraper.ATTEMPT_LOG.clear()
+
+    all_keys = list(scraper.load_sources())
+    target_keys = all_keys
+    if run.selected_companies is not None:
+        by_id = {_company_id(key): key for key in all_keys}
+        target_keys = [by_id[i] for i in run.selected_companies if i in by_id]
+        skipped = [c.name for c in run.companies.values()
+                  if c.id not in run.selected_companies]
+        if skipped:
+            run.log("info", f"Excluded from this run: {', '.join(skipped)}.")
+        for cs in run.companies.values():
+            if cs.id not in run.selected_companies:
+                cs.retrieval_status, cs.retrieval_progress = "skipped", 0
+
+    _fetch_sources(run, target_keys)
+
     failed = [c.name for c in run.companies.values()
               if c.retrieval_status not in ("done", "skipped")]
-    run.set_phase("retrieval", "done" if not failed else "done")
+    run.set_phase("retrieval", "done")
     if failed:
         run.log("warn", f"{len(failed)} source(s) unavailable: {', '.join(failed)}. "
                         f"The build continues with whatever landed.")
+
+
+def _execute_fetch_missing(run: RunState, companies: list[str] | None):
+    """Fetch automatically whichever sources are still missing/failed on an
+    already-paused (awaiting_review) run - e.g. after a manual-upload run's
+    user supplied some filings by hand and wants the rest retrieved instead
+    of uploading everything themselves. Runs within the SAME run (no new
+    run_id) and leaves it awaiting_review again afterward, so the review
+    screen just gains newly-fetched files rather than the run moving on.
+
+    `companies`, if given, restricts the fetch to that subset of company ids
+    (retried regardless of their current status); omitted means every
+    currently missing/failed source that's selected for this run."""
+    from competitor_analysis.ingestion import scraper
+
+    stream = _ActivityStream(run)
+    run.status = "running"
+    try:
+        with redirect_stdout(stream), redirect_stderr(stream):
+            cfg.set_period(run.fy, run.quarter)
+            by_id = {_company_id(key): key for key in scraper.load_sources()}
+            if companies is not None:
+                target_keys = [by_id[i] for i in companies if i in by_id]
+            else:
+                target_keys = [
+                    by_id[cs.id] for cs in run.companies.values()
+                    if cs.id in by_id and cs.retrieval_status in ("missing", "failed")
+                    and (run.selected_companies is None or cs.id in run.selected_companies)
+                ]
+            if not target_keys:
+                run.log("info", "Nothing to fetch - every selected source already has a file.")
+            else:
+                run.log("info", f"Fetching automatically: {', '.join(target_keys)}.")
+                run.set_phase("retrieval", "running")
+                scraper.ATTEMPT_LOG.clear()
+                _fetch_sources(run, target_keys)
+                run.set_phase("retrieval", "done")
+                still_missing = [k for k in target_keys
+                                 if run.companies.get(_company_id(k), None) is None
+                                 or run.companies[_company_id(k)].retrieval_status not in ("done", "skipped")]
+                if still_missing:
+                    run.log("warn", f"Still unavailable: {', '.join(still_missing)}.")
+                else:
+                    run.log("success", "All requested sources fetched.")
+    except Exception as e:
+        run.log("error", f"Automatic fetch failed: {type(e).__name__}: {e}")
+    finally:
+        stream.flush()
+        run.status = "awaiting_review"
+        r2.sync_run_outputs()
 
 
 def _start_parse_prewarm(run: RunState):

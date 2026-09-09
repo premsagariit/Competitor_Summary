@@ -93,15 +93,36 @@ export const API = {
     return request("/pipeline/run", { method: "POST", body: { fy, quarter, stages, companies } });
   },
 
+  /** Start a run that skips retrieval entirely - lands straight in
+   * "awaiting_review" so every source's file can be uploaded by hand before
+   * extraction runs, for a user who already has the filings. */
+  startManual(fy, quarter, companies = null) {
+    return request("/pipeline/manual", { method: "POST", body: { fy, quarter, companies } });
+  },
+
   getPipelineStatus(runId, signal) {
     return request(`/pipeline/${runId}/status`, { signal });
+  },
+
+  /** Fetch automatically whichever sources are still missing/failed on a
+   * paused run, without starting a new run - e.g. the rest of a manual-upload
+   * run's sources, or a single failed source retried on its own. `companies`,
+   * if given, restricts the fetch to that subset; null/omitted means every
+   * currently missing/failed selected source. */
+  fetchMissing(runId, companies = null) {
+    return request(`/pipeline/${runId}/fetch-missing`, { method: "POST", body: { companies } });
   },
 
   listRuns: () => request("/pipeline/runs"),
 
   /** Resume a run that paused after Phase 1 for document review, into
-   * extraction/reporting. Same run id, not a new run. */
+   * extraction. Same run id, not a new run - lands at "awaiting_report" once
+   * extraction finishes, for a second review before reporting. */
   continuePipeline: (runId) => request(`/pipeline/${runId}/continue`, { method: "POST" }),
+
+  /** Resume a run that paused after Phase 2 for Data Engine review, into
+   * reporting. Same run id, not a new run. */
+  continueToReport: (runId) => request(`/pipeline/${runId}/continue-report`, { method: "POST" }),
 
   // -- Phase 1 document review ----------------------------------------------
   // A downloaded (or manually uploaded) source file, viewable while a run is
@@ -143,5 +164,14 @@ export const API = {
   downloadDataEngine(runId) {
     if (!runId) throw new ApiError("No run selected.", 0, null);
     window.open(API.dataEngineUrl(runId), "_blank", "noopener");
+  },
+
+  /** Replace the Data Engine workbook with a hand-edited version, while the
+   * run is paused at "awaiting_report" for exactly this review. Returns the
+   * updated run snapshot. */
+  uploadDataEngine(runId, file) {
+    const form = new FormData();
+    form.append("file", file);
+    return requestFile(`/data-engine/${runId}/upload`, "POST", form);
   },
 };

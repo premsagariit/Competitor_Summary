@@ -98,6 +98,23 @@ class RunRequest(BaseModel):
                     "include in this run. Omit or null for all configured sources.")
 
 
+class ManualRunRequest(BaseModel):
+    fy: str = Field(..., examples=["FY25-26"])
+    quarter: str = Field(..., examples=["Q3"])
+    companies: list[str] | None = Field(
+        default=None,
+        description="Subset of company ids to include; omit or null for all "
+                    "configured sources.")
+
+
+class FetchMissingRequest(BaseModel):
+    companies: list[str] | None = Field(
+        default=None,
+        description="Subset of company ids to fetch, regardless of their "
+                    "current status. Omit or null to fetch every currently "
+                    "missing/failed source selected for this run.")
+
+
 def _serialise_run(run) -> dict:
     return {
         "runId": run.run_id,
@@ -216,6 +233,29 @@ def start_run(req: RunRequest):
     return _serialise_run(run)
 
 
+@app.post("/api/pipeline/manual")
+def start_manual_run(req: ManualRunRequest):
+    """Start a run that skips retrieval entirely, for a user who already has
+    the filings and wants to upload them directly rather than wait on (or
+    pay for) Phase 1. Lands straight in "awaiting_review" - the same state
+    the review screen already handles - with every source starting "missing"
+    so its upload control is available immediately."""
+    quarter = req.quarter.strip().upper()
+    try:
+        fy = cfg.normalize_fy(req.fy)
+        cfg.set_period(fy, quarter)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if req.companies is not None and len(req.companies) == 0:
+        raise HTTPException(status_code=400,
+                            detail="At least one company must be selected to run the pipeline.")
+    try:
+        run = REGISTRY.start_manual(fy, quarter, companies=req.companies)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return _serialise_run(run)
+
+
 @app.get("/api/pipeline/runs")
 def list_runs():
     return {"runs": [{"runId": r.run_id, "fy": r.fy, "quarter": r.quarter,
@@ -232,15 +272,52 @@ def run_status(run_id: str):
     return _serialise_run(run)
 
 
+@app.post("/api/pipeline/{run_id}/fetch-missing")
+def fetch_missing(run_id: str, req: FetchMissingRequest = FetchMissingRequest()):
+    """Fetch automatically whichever sources are still missing/failed on a
+    paused run, without starting a new run - for a manual-upload run where
+    the user supplied some sources by hand and wants the rest retrieved, or
+    a normal run where one source failed and the user wants just that one
+    retried. Runs Phase 1 scoped to those sources, then returns to
+    awaiting_review either way."""
+    if REGISTRY.get(run_id) is None:
+        raise HTTPException(status_code=404, detail=f"No such run: {run_id}")
+    try:
+        run = REGISTRY.fetch_missing(run_id, companies=req.companies)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return _serialise_run(run)
+
+
 @app.post("/api/pipeline/{run_id}/continue")
 def continue_run(run_id: str):
     """Resume a run that paused after Phase 1 so a reviewer could confirm the
-    retrieved documents. Runs Phases 2-3 against whatever is on disk now,
-    including anything replaced, removed or uploaded during the pause."""
+    retrieved documents. Runs Phase 2 against whatever is on disk now,
+    including anything replaced, removed or uploaded during the pause, then
+    pauses again at "awaiting_report" for the Data Engine workbook to be
+    reviewed before Phase 3 reads it - see /continue-report."""
     if REGISTRY.get(run_id) is None:
         raise HTTPException(status_code=404, detail=f"No such run: {run_id}")
     try:
         run = REGISTRY.continue_build(run_id)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return _serialise_run(run)
+
+
+@app.post("/api/pipeline/{run_id}/continue-report")
+def continue_report(run_id: str):
+    """Resume a run that paused after Phase 2 so a reviewer could check the
+    filled Data Engine workbook. Runs Phase 3 against whatever workbook is on
+    disk now, including a replacement uploaded during the pause."""
+    if REGISTRY.get(run_id) is None:
+        raise HTTPException(status_code=404, detail=f"No such run: {run_id}")
+    try:
+        run = REGISTRY.continue_report(run_id)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except RuntimeError as e:
@@ -374,3 +451,48 @@ def download_data_engine(run_id: str):
         run.data_engine_path,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename=os.path.basename(run.data_engine_path))
+
+
+@app.post("/api/data-engine/{run_id}/upload")
+async def upload_data_engine(run_id: str, file: UploadFile = File(...)):
+    """Replace the Data Engine workbook with a hand-edited version, while the
+    run is paused at "awaiting_report" for exactly this review. Report
+    generation (continue-report) reads whatever is at run.data_engine_path,
+    so this is the same swap-in-place the document review endpoints already
+    do for a source PDF."""
+    run = REGISTRY.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"No such run: {run_id}")
+    if run.status not in ("awaiting_report", "failed"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"The Data Engine workbook can only be replaced while a run is "
+                   f"awaiting report review (current status: {run.status}).")
+    if not run.data_engine_path:
+        raise HTTPException(status_code=409,
+                            detail="This run has no Data Engine workbook to replace yet.")
+    uploaded_ext = os.path.splitext(file.filename or "")[1].lower()
+    if uploaded_ext and uploaded_ext != ".xlsx":
+        raise HTTPException(status_code=400,
+                            detail=f"Expected a .xlsx file, got {uploaded_ext}.")
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="File too large (limit 50 MB).")
+    # A quick load (not just the extension) catches a corrupted or non-Excel
+    # file here, at upload time, rather than as a confusing failure deep
+    # inside report generation once continue-report reads it.
+    import io
+    import openpyxl
+    try:
+        openpyxl.load_workbook(io.BytesIO(content), read_only=True).close()
+    except Exception:
+        raise HTTPException(status_code=400,
+                            detail="Not a valid Excel (.xlsx) workbook.")
+    paths.ensure_parent(run.data_engine_path)
+    with open(run.data_engine_path, "wb") as f:
+        f.write(content)
+    r2.upload_file(run.data_engine_path)
+    run.log("success", f"Data Engine workbook replaced manually ({len(content)} bytes).")
+    return _serialise_run(run)

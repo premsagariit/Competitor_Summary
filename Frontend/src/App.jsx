@@ -175,6 +175,15 @@ export default function App() {
           });
           return; // stop polling until the reviewer continues
         }
+        if (snap.status === "awaiting_report") {
+          setRunning(false);
+          toast({
+            kind: "info",
+            title: "Data Engine ready",
+            description: "Review the workbook, then continue to report generation.",
+          });
+          return; // stop polling until the reviewer continues
+        }
         if (snap.status === "completed" || snap.status === "failed") {
           setRunning(false);
           if (snap.status === "failed") {
@@ -244,6 +253,46 @@ export default function App() {
   const runPipeline = () => startRun(["download"]);
   const runBuildOnly = () => startRun(["build"]);
 
+  // Skip retrieval entirely: lands straight on the review screen with every
+  // source "missing", ready for a manual upload - no polling needed since
+  // nothing is running server-side until continueToBuild() is called.
+  async function startManualUpload() {
+    if (running) return;
+    if (selectedCompanies.size === 0) {
+      toast({
+        kind: "error",
+        title: "No companies selected",
+        description: "Select at least one company before starting a run.",
+      });
+      return;
+    }
+    setElapsed(0);
+    setReportProgress(0);
+    setReportReady(false);
+    setPhases(EMPTY_PHASES);
+    setCompanies(idleCompanies(companyList));
+    setActivity([{ level: "info", text: `Starting ${fy} ${quarter} (manual upload)…`, time: nowTime() }]);
+    try {
+      const run = await API.startManual(fy, quarter, Array.from(selectedCompanies));
+      setRunId(run.runId);
+      applySnapshot(run);
+      setView("retrieval");
+      toast({
+        kind: "info",
+        title: "Retrieval skipped",
+        description: "Upload each source's file below, then continue to extraction.",
+      });
+    } catch (e) {
+      toast({
+        kind: e.status === 409 ? "info" : "error",
+        title: e.status === 409 ? "Already running" : "Could not start",
+        description: e.message,
+      });
+      log("error", e.message);
+      if (e.status === 0) setBackend({ status: "offline", detail: e.message });
+    }
+  }
+
   function toggleCompany(id) {
     setSelectedCompanies((prev) => {
       const next = new Set(prev);
@@ -261,13 +310,40 @@ export default function App() {
       const snap = await API.continuePipeline(runId);
       applySnapshot(snap);
       setRunning(true);
-      toast({ kind: "info", title: "Continuing pipeline", description: "Extraction, reporting and review run next." });
+      toast({ kind: "info", title: "Continuing pipeline", description: "Extraction runs next, then a Data Engine review." });
     } catch (e) {
       toast({
         kind: e.status === 409 ? "info" : "error",
         title: e.status === 409 ? "Cannot continue yet" : "Could not continue",
         description: e.message,
       });
+    }
+  }
+
+  async function continueToReport() {
+    if (!runId) return;
+    try {
+      const snap = await API.continueToReport(runId);
+      applySnapshot(snap);
+      setRunning(true);
+      toast({ kind: "info", title: "Continuing pipeline", description: "Report generation runs next." });
+    } catch (e) {
+      toast({
+        kind: e.status === 409 ? "info" : "error",
+        title: e.status === 409 ? "Cannot continue yet" : "Could not continue",
+        description: e.message,
+      });
+    }
+  }
+
+  async function uploadDataEngineFile(file) {
+    if (!runId) return;
+    try {
+      const snap = await API.uploadDataEngine(runId, file);
+      applySnapshot(snap);
+      toast({ kind: "success", title: "Data Engine replaced", description: "Report generation will read this workbook." });
+    } catch (e) {
+      toast({ kind: "error", title: "Upload failed", description: e.message });
     }
   }
 
@@ -309,17 +385,37 @@ export default function App() {
     setFyDraft("");
   }
 
-  function retryRetrieval() {
-    // Per-company retry needs a backend endpoint that re-runs Phase 1 for one
-    // source; until that exists, re-running the download stage is the honest
-    // equivalent rather than a no-op that looks like it worked.
-    toast({
-      kind: "info",
-      title: "Re-running retrieval",
-      description: "Per-source retry isn't available yet — running the download stage for all sources.",
-    });
-    startRun(["download"]);
+  // Fetch automatically, within the SAME run (no new run_id), whichever
+  // sources are still missing/failed - either a specific subset (one
+  // company retried, or the rest of a manual-upload run) or, with
+  // `companies` omitted, every currently missing/failed selected source.
+  // Reuses the polling effect: it's gated on `running`, not on which status
+  // it's waiting for, so it picks back up here exactly as it does for a
+  // fresh download and stops again once the fetch returns to awaiting_review.
+  async function fetchMissingSources(companies = null) {
+    if (!runId) return;
+    try {
+      const snap = await API.fetchMissing(runId, companies);
+      applySnapshot(snap);
+      setRunning(true);
+      toast({
+        kind: "info",
+        title: "Fetching automatically",
+        description: companies
+          ? `Retrying: ${companies.length} source(s).`
+          : "Fetching every source that's still missing.",
+      });
+    } catch (e) {
+      toast({
+        kind: e.status === 409 ? "info" : "error",
+        title: e.status === 409 ? "Cannot fetch right now" : "Could not start fetch",
+        description: e.message,
+      });
+    }
   }
+
+  const retryRetrieval = (companyId) => fetchMissingSources([companyId]);
+  const fetchAllMissing = () => fetchMissingSources(null);
 
   function downloadReport() {
     if (!reportReady) {
@@ -517,6 +613,11 @@ export default function App() {
                 <AppIcon name="arrowRight" className="w-4 h-4" />
                 Continue to Extraction
               </Button>
+            ) : runStatus === "awaiting_report" ? (
+              <Button onClick={continueToReport} disabled={running}>
+                <AppIcon name="arrowRight" className="w-4 h-4" />
+                Continue to Report Generation
+              </Button>
             ) : (
               <Button
                 onClick={runPipeline}
@@ -536,6 +637,7 @@ export default function App() {
               state={state}
               onNavigate={setView}
               onRun={runPipeline}
+              onManual={startManualUpload}
               onToggleCompany={toggleCompany}
               onSelectAll={selectAllCompanies}
               onSelectNone={selectNoCompanies}
@@ -545,13 +647,21 @@ export default function App() {
             <RetrievalView
               state={state}
               onRetry={retryRetrieval}
+              onFetchAllMissing={fetchAllMissing}
               onView={viewDownloadedFile}
               onDelete={deleteDownloadedFile}
               onUpload={uploadDownloadedFile}
               onContinue={continueToBuild}
             />
           )}
-          {view === "extraction" && <ExtractionView state={state} onDownloadDataEngine={downloadDataEngine} />}
+          {view === "extraction" && (
+            <ExtractionView
+              state={state}
+              onDownloadDataEngine={downloadDataEngine}
+              onUploadDataEngine={uploadDataEngineFile}
+              onContinue={continueToReport}
+            />
+          )}
           {view === "reporting" && <ReportsView state={state} onDownload={downloadReport} />}
         </main>
       </div>

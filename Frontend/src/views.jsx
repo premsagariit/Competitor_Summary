@@ -48,9 +48,14 @@ function phaseTone(status) {
 // ---------------------------------------------------------------------------
 // Overview
 // ---------------------------------------------------------------------------
-export function OverviewView({ state, onNavigate, onRun, onToggleCompany, onSelectAll, onSelectNone }) {
+export function OverviewView({ state, onNavigate, onRun, onManual, onToggleCompany, onSelectAll, onSelectNone }) {
   const { phases, companies, activity, running, elapsed, reportProgress } = state;
   const awaitingReview = state.runStatus === "awaiting_review";
+  const awaitingReport = state.runStatus === "awaiting_report";
+  // Retrieval is marked "skipped" (rather than "done") only for a run
+  // started via the manual-upload path - distinguishes "review what was
+  // fetched" from "upload what was never fetched" for the banner below.
+  const manualUpload = phases.find((p) => p.key === "retrieval")?.status === "skipped";
 
   return (
     <div className="flex flex-col gap-6">
@@ -71,21 +76,43 @@ export function OverviewView({ state, onNavigate, onRun, onToggleCompany, onSele
             {awaitingReview ? (
               <Button onClick={() => onNavigate("retrieval")}>
                 <AppIcon name="alertTriangle" className="w-4 h-4" />
-                Review documents
+                {manualUpload ? "Upload documents" : "Review documents"}
+              </Button>
+            ) : awaitingReport ? (
+              <Button onClick={() => onNavigate("extraction")}>
+                <AppIcon name="alertTriangle" className="w-4 h-4" />
+                Review Data Engine
               </Button>
             ) : (
-              <Button onClick={onRun} disabled={running}>
-                {running ? <Spinner className="w-4 h-4" /> : <AppIcon name="play" className="w-4 h-4" />}
-                {running ? "Running…" : "Start Pipeline"}
-              </Button>
+              <div className="flex items-center gap-2.5">
+                <Button variant="ghost" onClick={onManual} disabled={running}
+                        title="Skip retrieval and upload each source's filing yourself">
+                  <AppIcon name="upload" className="w-4 h-4" />
+                  Upload manually
+                </Button>
+                <Button onClick={onRun} disabled={running}>
+                  {running ? <Spinner className="w-4 h-4" /> : <AppIcon name="play" className="w-4 h-4" />}
+                  {running ? "Running…" : "Start Pipeline"}
+                </Button>
+              </div>
             )}
           </div>
         </div>
         {awaitingReview && (
           <div className="mb-5 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 flex items-center gap-2.5 text-amber-200 text-sm">
             <AppIcon name="alertTriangle" className="w-4 h-4 shrink-0" />
-            Documents retrieved for {state.fy} {state.quarter}. Confirm each file on the
-            Document Retrieval screen before extraction runs.
+            {manualUpload
+              ? `Retrieval skipped for ${state.fy} ${state.quarter}. Upload each source's file on the `
+              + `Document Retrieval screen before extraction runs.`
+              : `Documents retrieved for ${state.fy} ${state.quarter}. Confirm each file on the `
+              + `Document Retrieval screen before extraction runs.`}
+          </div>
+        )}
+        {awaitingReport && (
+          <div className="mb-5 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 flex items-center gap-2.5 text-amber-200 text-sm">
+            <AppIcon name="alertTriangle" className="w-4 h-4 shrink-0" />
+            {`Data Engine ready for ${state.fy} ${state.quarter}. Download and check it on the `
+            + `Data Extraction screen — replace it if needed — before the report is generated.`}
           </div>
         )}
         <PhaseStepper phases={phases} activeKey={null} onSelect={onNavigate} />
@@ -163,18 +190,27 @@ function tierBadge(tier) {
   return <Badge tone={tones[tier] || "slate"}>{tier}</Badge>;
 }
 
-export function RetrievalView({ state, onRetry, onView, onDelete, onUpload, onContinue }) {
+export function RetrievalView({ state, onRetry, onFetchAllMissing, onView, onDelete, onUpload, onContinue }) {
   // Files can only be viewed while a run is paused for review (or crashed
   // during retrieval) - matching the backend's guard, so a click never just
   // bounces off a 409.
   const reviewable = state.runStatus === "awaiting_review" || state.runStatus === "failed";
+  // Retrieval is marked "skipped" (rather than "done") only for a run
+  // started via the manual-upload path.
+  const manualUpload = state.phases.find((p) => p.key === "retrieval")?.status === "skipped";
+  const missingCount = Object.values(state.companies)
+    .filter((c) => c.retrieval.status === "missing" || c.retrieval.status === "failed").length;
 
   return (
     <Card className="p-5">
       <div className="flex items-center justify-between mb-5 flex-wrap gap-3">
         <div>
           <h2 className="text-lg font-semibold text-white">Document Retrieval</h2>
-          <p className="text-sm text-slate-400 mt-0.5">Parallel AI agents fetching public disclosures for {state.fy} {state.quarter}</p>
+          <p className="text-sm text-slate-400 mt-0.5">
+            {manualUpload
+              ? `Manual upload for ${state.fy} ${state.quarter} — retrieval was skipped`
+              : `Parallel AI agents fetching public disclosures for ${state.fy} ${state.quarter}`}
+          </p>
         </div>
         <Badge tone="slate">{Object.keys(state.companies).length} sources</Badge>
       </div>
@@ -183,12 +219,26 @@ export function RetrievalView({ state, onRetry, onView, onDelete, onUpload, onCo
         <div className="mb-5 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 flex items-center justify-between gap-4 flex-wrap">
           <div className="flex items-center gap-2.5 text-amber-200 text-sm">
             <AppIcon name="alertTriangle" className="w-4 h-4 shrink-0" />
-            Confirm the file for each source below — open it with the eye icon, remove a
-            wrong one, or upload a replacement. Continue once the set looks right.
+            {manualUpload
+              ? "Upload the file for each source below using the upload control. Continue once every source you need is in place."
+              : "Confirm the file for each source below — open it with the eye icon, remove a wrong one, or upload a replacement. Continue once the set looks right."}
           </div>
-          <Button onClick={onContinue}>
-            <AppIcon name="arrowRight" className="w-4 h-4" /> Continue to Extraction
-          </Button>
+          <div className="flex items-center gap-2.5">
+            {missingCount > 0 && (
+              <Button variant="ghost" onClick={onFetchAllMissing}
+                      title="Fetch every source still missing automatically, without uploading anything">
+                <AppIcon name="refresh" className="w-4 h-4" />
+                Fetch remaining automatically ({missingCount})
+              </Button>
+            )}
+            <Button
+              onClick={onContinue}
+              disabled={manualUpload && !Object.values(state.companies).some((c) => c.retrieval.status === "done")}
+              title={manualUpload ? "Upload at least one source's file first" : undefined}
+            >
+              <AppIcon name="arrowRight" className="w-4 h-4" /> Continue to Extraction
+            </Button>
+          </div>
         </div>
       )}
 
@@ -232,9 +282,14 @@ export function RetrievalView({ state, onRetry, onView, onDelete, onUpload, onCo
                   )}
                 </span>
               </div>
-              {c.retrieval.status === "failed" && (
-                <Button variant="danger" className="w-full justify-center !py-1.5" onClick={() => onRetry(id)}>
-                  <AppIcon name="refresh" className="w-3.5 h-3.5" /> Retry retrieval
+              {reviewable && (c.retrieval.status === "failed" || c.retrieval.status === "missing") && (
+                <Button
+                  variant={c.retrieval.status === "failed" ? "danger" : "ghost"}
+                  className="w-full justify-center !py-1.5"
+                  onClick={() => onRetry(id)}
+                >
+                  <AppIcon name="refresh" className="w-3.5 h-3.5" />
+                  {c.retrieval.status === "failed" ? "Retry retrieval" : "Fetch automatically"}
                 </Button>
               )}
               {!hasFile && reviewable && c.retrieval.status !== "skipped" && (
@@ -264,7 +319,8 @@ export function RetrievalView({ state, onRetry, onView, onDelete, onUpload, onCo
 // ---------------------------------------------------------------------------
 // Extraction (Phase 2)
 // ---------------------------------------------------------------------------
-export function ExtractionView({ state, onDownloadDataEngine }) {
+export function ExtractionView({ state, onDownloadDataEngine, onUploadDataEngine, onContinue }) {
+  const awaitingReport = state.runStatus === "awaiting_report";
   return (
     <Card className="p-5">
       <div className="flex items-start justify-between gap-4 mb-5">
@@ -289,6 +345,36 @@ export function ExtractionView({ state, onDownloadDataEngine }) {
           </span>
         </div>
       </div>
+
+      {awaitingReport && (
+        <div className="mb-5 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 flex items-center justify-between gap-4 flex-wrap">
+          <div className="flex items-center gap-2.5 text-amber-200 text-sm">
+            <AppIcon name="alertTriangle" className="w-4 h-4 shrink-0" />
+            Download the Data Engine workbook and check it. If something looks wrong, fix it
+            and upload the corrected file — otherwise continue straight to report generation.
+          </div>
+          <div className="flex items-center gap-2.5">
+            <label className="inline-flex items-center gap-1.5 text-xs text-brand-300 border border-dashed border-brand-500/40 rounded-lg px-3 py-2 cursor-pointer hover:bg-brand-500/10">
+              <AppIcon name="upload" className="w-3.5 h-3.5" />
+              Upload corrected workbook
+              <input
+                type="file"
+                accept=".xlsx"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) onUploadDataEngine(file);
+                  e.target.value = "";
+                }}
+              />
+            </label>
+            <Button onClick={onContinue}>
+              <AppIcon name="arrowRight" className="w-4 h-4" /> Continue to Report Generation
+            </Button>
+          </div>
+        </div>
+      )}
+
       <div className="overflow-x-auto scrollbar-thin">
         <table className="w-full text-sm">
           <thead>

@@ -13,6 +13,7 @@ pdfplumber
 pypdf
 openpyxl
 google-genai
+pydantic
 
 # Phase 3 - reporting
 matplotlib

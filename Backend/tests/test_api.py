@@ -125,10 +125,11 @@ def _await_run(run_id, timeout=15):
     deadline = time.time() + timeout
     while time.time() < deadline:
         body = client.get(f"/api/pipeline/{run_id}/status").json()
-        # "awaiting_review" is a legitimate stopping point for a download-only
-        # run - the thread has finished its work and is waiting on a human,
+        # "awaiting_review"/"awaiting_report" are legitimate stopping points -
+        # the thread has finished its current stage and is waiting on a
+        # human (to review retrieved documents, or the Data Engine workbook),
         # not still in flight.
-        if body["status"] in ("completed", "failed", "awaiting_review"):
+        if body["status"] in ("completed", "failed", "awaiting_review", "awaiting_report"):
             return body
         time.sleep(0.05)
     raise AssertionError(f"run {run_id} did not finish within {timeout}s")
@@ -137,7 +138,18 @@ def _await_run(run_id, timeout=15):
 def test_full_run_walks_every_phase(stub_pipeline):
     r = client.post("/api/pipeline/run", json={"fy": "FY25-26", "quarter": "Q3"})
     assert r.status_code == 200
-    body = _await_run(r.json()["runId"])
+    run_id = r.json()["runId"]
+
+    # First pause: retrieval + extraction ran, waiting on Data Engine review
+    # before the report is built from it.
+    body = _await_run(run_id)
+    assert body["status"] == "awaiting_report"
+    assert stub_pipeline == ["retrieval", "extraction"]
+
+    # Continue past that review into reporting.
+    r2 = client.post(f"/api/pipeline/{run_id}/continue-report")
+    assert r2.status_code == 200
+    body = _await_run(run_id)
     assert body["status"] == "completed"
     assert stub_pipeline == ["retrieval", "extraction", "reporting"]
     assert {p["key"]: p["status"] for p in body["phases"]} == {
@@ -375,8 +387,10 @@ def test_continue_runs_the_build_stage_on_the_same_run(downloads, stub_pipeline,
     assert r.status_code == 200
     body = _await_run(awaiting_review_run)
     assert body["runId"] == awaiting_review_run
-    assert stub_pipeline == ["retrieval", "extraction", "reporting"]
-    assert body["status"] == "completed"
+    # Extraction ran, but reporting does not: the run pauses again for Data
+    # Engine review rather than continuing straight through to reporting.
+    assert stub_pipeline == ["retrieval", "extraction"]
+    assert body["status"] == "awaiting_report"
 
 
 def test_continue_is_rejected_when_not_awaiting_review(downloads, stub_pipeline):
@@ -462,3 +476,142 @@ def test_prewarm_failure_never_fails_the_run(monkeypatch):
 
     assert run.status == "awaiting_review", "a prewarm error must not fail the run"
     assert run.error is None
+
+
+# ---------------------------------------------------------------------------
+# Data Engine review (the Phase 2 -> Phase 3 gate)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def awaiting_report_run(monkeypatch, tmp_path):
+    """Drives a run to the "awaiting_report" pause with a real (tiny, valid)
+    Data Engine workbook on disk, so the upload/download endpoints for it
+    have something real to act on. Returns (run_id, engine_path, calls)."""
+    import openpyxl
+
+    engine_path = tmp_path / "Data_Engine.xlsx"
+    openpyxl.Workbook().save(engine_path)
+    calls = []
+
+    def fake_retrieval(run):
+        calls.append("retrieval")
+        run.set_phase("retrieval", "done")
+
+    def fake_extraction(run):
+        calls.append("extraction")
+        run.set_phase("extraction", "done")
+        run.data_engine_path = str(engine_path)
+
+    def fake_reporting(run):
+        calls.append("reporting")
+        run.report_progress = 100
+        run.set_phase("reporting", "done")
+
+    monkeypatch.setattr(runs_mod, "_phase_retrieval", fake_retrieval)
+    monkeypatch.setattr(runs_mod, "_phase_extraction", fake_extraction)
+    monkeypatch.setattr(runs_mod, "_phase_reporting", fake_reporting)
+
+    r = client.post("/api/pipeline/run", json={"fy": "FY25-26", "quarter": "Q3"})
+    rid = r.json()["runId"]
+    _await_run(rid)
+    return rid, engine_path, calls
+
+
+def test_extraction_pause_reports_awaiting_report(awaiting_report_run):
+    rid, _, _ = awaiting_report_run
+    body = client.get(f"/api/pipeline/{rid}/status").json()
+    assert body["status"] == "awaiting_report"
+    assert body["dataEngineReady"] is True
+
+
+def test_awaiting_report_blocks_a_second_run(awaiting_report_run):
+    """A paused Data Engine review still owns the workbook a second run
+    would write to, so it counts as active exactly like a running one does."""
+    rid, _, _ = awaiting_report_run
+    r = client.post("/api/pipeline/run", json={"fy": "FY25-26", "quarter": "Q3"})
+    assert r.status_code == 409
+
+
+def test_data_engine_upload_replaces_the_workbook(awaiting_report_run):
+    import io
+    import openpyxl
+
+    rid, engine_path, _ = awaiting_report_run
+    wb = openpyxl.Workbook()
+    wb.active["A1"] = "replaced"
+    buf = io.BytesIO()
+    wb.save(buf)
+    r = client.post(
+        f"/api/data-engine/{rid}/upload",
+        files={"file": ("Data_Engine.xlsx", buf.getvalue(),
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+    assert r.status_code == 200
+    reloaded = openpyxl.load_workbook(engine_path)
+    assert reloaded.active["A1"].value == "replaced"
+
+
+def test_data_engine_upload_rejects_wrong_extension(awaiting_report_run):
+    rid, _, _ = awaiting_report_run
+    r = client.post(f"/api/data-engine/{rid}/upload",
+                    files={"file": ("wrong.pdf", b"data", "application/pdf")})
+    assert r.status_code == 400
+
+
+def test_data_engine_upload_rejects_a_corrupt_workbook(awaiting_report_run):
+    rid, _, _ = awaiting_report_run
+    r = client.post(
+        f"/api/data-engine/{rid}/upload",
+        files={"file": ("Data_Engine.xlsx", b"not a real xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+    assert r.status_code == 400
+
+
+def test_data_engine_upload_rejects_an_empty_file(awaiting_report_run):
+    rid, _, _ = awaiting_report_run
+    r = client.post(
+        f"/api/data-engine/{rid}/upload",
+        files={"file": ("Data_Engine.xlsx", b"",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+    assert r.status_code == 400
+
+
+def test_continue_report_runs_reporting_and_completes(awaiting_report_run):
+    rid, _, calls = awaiting_report_run
+    assert calls == ["retrieval", "extraction"]
+    r = client.post(f"/api/pipeline/{rid}/continue-report")
+    assert r.status_code == 200
+    body = _await_run(rid)
+    assert calls == ["retrieval", "extraction", "reporting"]
+    assert body["status"] == "completed"
+
+
+def test_continue_report_is_rejected_when_not_awaiting_report(stub_pipeline):
+    r = client.post("/api/pipeline/run",
+                    json={"fy": "FY25-26", "quarter": "Q3", "stages": ["download"]})
+    rid = r.json()["runId"]
+    _await_run(rid)  # lands at awaiting_review, not awaiting_report
+    got = client.post(f"/api/pipeline/{rid}/continue-report")
+    assert got.status_code == 409
+
+
+def test_continue_report_on_unknown_run_is_404():
+    assert client.post("/api/pipeline/nope/continue-report").status_code == 404
+
+
+def test_data_engine_upload_blocked_once_report_is_over(awaiting_report_run):
+    rid, _, _ = awaiting_report_run
+    client.post(f"/api/pipeline/{rid}/continue-report")
+    _await_run(rid)
+    got = client.post(
+        f"/api/data-engine/{rid}/upload",
+        files={"file": ("x.xlsx", b"data",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+    assert got.status_code == 409
+
+
+def test_data_engine_upload_on_unknown_run_is_404():
+    r = client.post(
+        "/api/data-engine/nope/upload",
+        files={"file": ("x.xlsx", b"data",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+    assert r.status_code == 404
