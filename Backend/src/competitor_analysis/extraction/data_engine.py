@@ -29,7 +29,7 @@ import sys
 import openpyxl
 
 from competitor_analysis.extraction.forms import (COMPANY_PDFS, get_form_page, get_line_item, get_line_item_any,
-                          get_form_text, get_line_item_from_text,
+                          get_form_text, get_line_item_from_text, sum_rows_after,
                           extract_nl36 as pdf_extract_nl36, NL36_CHANNELS,
                           RESOLUTION_LOG, year_frags as pdf_extract_year_frags)
 from competitor_analysis.extraction import gemini as gemini_extract
@@ -841,27 +841,47 @@ def extract_income_statement(company_short, pdf_path):
         ph_interest = get_line_item(nl1, "Interest,", "Rent")
         ph_profit_sale = get_line_item(nl1, "sale", "investments")
         out["Claims"] = tuple(lakhs_to_cr(v) for v in claims)
-        overheads = tuple(
-            (a or 0) + (b or 0) if a is not None and b is not None else None
-            for a, b in zip(commission, opex)
-        )
-        out["Total Overheads"] = tuple(lakhs_to_cr(v) for v in overheads)
         out["Operating Expenses"] = tuple(lakhs_to_cr(v) for v in opex)
     elif nl1_text:
         claims = get_line_item_from_text(nl1_text, "Claims Incurred", form="NL-1")
         commission = get_line_item_from_text(nl1_text, "Commission", form="NL-1")
         opex = get_line_item_from_text(nl1_text, "Operating Expenses related to Insurance Business", form="NL-1")
-        ph_interest = get_line_item_from_text(nl1_text, "Interest, Dividend", form="NL-1")
+        # "Gross" is included in the label match (and so gets stripped along
+        # with it) specifically to consume a stray "-" that some insurers
+        # print as a typographic dash before "(Gross)" (e.g. "Interest,
+        # Dividend and Rent - (Gross)") - left unstripped, _NUM_TOKEN reads
+        # that dash as a zero-value placeholder cell and shifts every
+        # following column left by one.
+        ph_interest = get_line_item_from_text(nl1_text, "Interest, Dividend", "Gross", form="NL-1")
         ph_profit_sale = get_line_item_from_text(nl1_text, "Profit / Loss on Sale", form="NL-1")
         out["Claims"] = tuple(lakhs_to_cr(v) for v in claims)
-        overheads = tuple(
-            (a or 0) + (b or 0) if a is not None and b is not None else None
-            for a, b in zip(commission, opex)
-        )
-        out["Total Overheads"] = tuple(lakhs_to_cr(v) for v in overheads)
         out["Operating Expenses"] = tuple(lakhs_to_cr(v) for v in opex)
     else:
+        commission = opex = (None, None)
         ph_interest = ph_profit_sale = (None, None)
+
+    # NL-2's "TOTAL (B)" line is PROVISIONS (Other than Taxation, section 4)
+    # plus OTHER EXPENSES (section 5) combined - verified against NBHI's own
+    # sub-items (65 + 946 = 1,011 = its printed TOTAL (B)). Section 5 includes
+    # "(f) Contribution to Policyholders' A/c" - the shareholders' account
+    # reimbursing the policyholders' account for something (excess Expense of
+    # Management, MD/CEO/WTD remuneration, or an "Others" catch-all) - an
+    # internal transfer, not a real operating cost, so it's excluded.
+    #
+    # That group is NOT one line: NBHI breaks it into three named sub-items -
+    # "(i) Towards Excess Expenses of Management", "(ii) Towards remuneration
+    # of MD/CEO/WTD/Other KMPs", "(iii) Others" - under a parent "(f)" row
+    # that itself carries no values, and WHICH sub-item is actually populated
+    # varies by quarter (NBHI's FY26-27 Q1 filing has a value only in (ii);
+    # its own FY25-26 Q1 comparative column has a value only in (i)) - so
+    # matching just one sub-item's wording silently misses whichever one is
+    # populated that quarter for that period. sum_rows_after sums every
+    # sub-row under the "(f)" parent instead of guessing which one to name.
+    # Narayana's filing instead prints this as ONE already-summed line
+    # ("Contribution to Policyholders Funds towards excess EoM") with no
+    # sub-item breakdown, which the broad "contribution to policyholders"
+    # search matches directly.
+    STOP_AFTER_CONTRIBUTION_GROUP = re.compile(r"^\(g\)|total", re.IGNORECASE)
 
     if nl2:
         sh_interest = get_line_item(nl2, "Interest,", "Rent")
@@ -870,35 +890,77 @@ def extract_income_statement(company_short, pdf_path):
         sh_amort = get_line_item(nl2, "Amortization of Premium")
         pbt = get_line_item(nl2, "Before Tax")
         pat = get_line_item(nl2, "after tax")
+        nl2_total_b = get_line_item(nl2, "TOTAL", "(B)")
+        nl2_contribution = sum_rows_after(nl2, ("Contribution to Policyholders",), STOP_AFTER_CONTRIBUTION_GROUP)
         out["PBT"] = tuple(lakhs_to_cr(v) for v in pbt)
         out["PAT"] = tuple(lakhs_to_cr(v) for v in pat)
     elif nl2_text:
-        # Gridline-less NL-2 (e.g. Narayana Health) - only PBT/PAT are
-        # extracted here (the shareholders'-account investment-income lines
-        # aren't reliably locatable from free text); Investment Income for
-        # such companies is computed from the policyholders'-account (NL-1)
-        # pieces alone, same as when NL-2 is entirely absent.
-        sh_interest = sh_profit_sale = sh_loss_sale = sh_amort = (None, None)
+        # Gridline-less NL-2 (e.g. Narayana Health): the shareholders'-account
+        # investment-income lines are read from the same "INCOME FROM
+        # INVESTMENTS" section as the gridded case, just via the text parser.
+        # Narayana's own layout merges profit/loss on sale into one signed
+        # line, so sh_loss_sale is fixed at (0, 0) rather than searched for
+        # separately - searching for it too would either find nothing (safe)
+        # or double-count a "Loss" substring inside the same profit/loss line.
+        sh_interest = get_line_item_from_text(nl2_text, "Interest and Dividend", form="NL-2")
+        sh_profit_sale = get_line_item_from_text(nl2_text, "Sale of Investments", form="NL-2")
+        sh_loss_sale = (0.0, 0.0)
+        sh_amort = get_line_item_from_text(nl2_text, "Amortis", "Premium", form="NL-2")
+        if sh_amort == (None, None):
+            sh_amort = get_line_item_from_text(nl2_text, "Amortiz", "Premium", form="NL-2")
         # "Before Tax" also matches an intermediate "...Before Tax Exceptional
         # Items" subtotal row that some insurers print above the real
         # bottom-line PBT row - exclude it explicitly.
         pbt = get_line_item_from_text(nl2_text, "Before Tax",
                                       exclude=["Exceptional"], form="NL-2")
         pat = get_line_item_from_text(nl2_text, "after tax", form="NL-2")
+        nl2_total_b = get_line_item_from_text(nl2_text, "TOTAL", "(B)", form="NL-2")
+        # Try the broad label first (matches Narayana's single combined line
+        # directly); the narrower "excess EoM"-only phrasings are a fallback
+        # for a gridline-less filing that happens to word it differently.
+        nl2_contribution = get_line_item_from_text(nl2_text, "Contribution to Policyholders", form="NL-2")
+        if nl2_contribution == (None, None):
+            for variant in [("towards excess", "management"), ("excess eom",), ("towards excess", "eom")]:
+                nl2_contribution = get_line_item_from_text(nl2_text, *variant, form="NL-2")
+                if nl2_contribution != (None, None):
+                    break
         out["PBT"] = tuple(lakhs_to_cr(v) for v in pbt)
         out["PAT"] = tuple(lakhs_to_cr(v) for v in pat)
     else:
         sh_interest = sh_profit_sale = sh_loss_sale = sh_amort = (None, None)
+        nl2_total_b = nl2_contribution = (None, None)
 
-    def sum4(*pairs):
+    def sum_available(*pairs):
+        """Sum whichever pairs have a value for each period - None only when
+        NOTHING in `pairs` has a value for that period, so one component this
+        run couldn't locate (e.g. a shareholders'-account line on a
+        gridline-less filing) degrades the total rather than blanking it."""
         result = []
         for i in (0, 1):
-            vals = [p[i] for p in pairs]
-            result.append(None if any(v is None for v in vals) else sum(vals))
+            vals = [p[i] for p in pairs if p[i] is not None]
+            result.append(sum(vals) if vals else None)
         return tuple(result)
 
-    inv_income = sum4(ph_interest, ph_profit_sale, sh_interest, sh_profit_sale, sh_loss_sale, sh_amort)
+    inv_income = sum_available(ph_interest, ph_profit_sale, sh_interest, sh_profit_sale, sh_loss_sale, sh_amort)
     out["Investment Income"] = tuple(lakhs_to_cr(v) for v in inv_income)
+
+    # Total Overheads = NL-1's Commission + Operating Expenses (these already
+    # equal NL-6's Net Commission / NL-7's Operating Expenses TOTAL - NL-1
+    # cites them by schedule number and restates their grand totals verbatim)
+    # plus NL-2's Provisions + Other Expenses, net of the Contribution to
+    # Policyholders' A/c inter-account transfer described above. Commission/
+    # opex missing is still fatal (there is no overheads figure at all
+    # without them); the NL-2 addend degrades to 0 if it can't be found,
+    # rather than blanking an otherwise-good NL-1-derived total.
+    nl2_addend = tuple(
+        (tb - (contrib or 0)) if tb is not None else None
+        for tb, contrib in zip(nl2_total_b, nl2_contribution)
+    )
+    overheads = tuple(
+        (a or 0) + (b or 0) + (nl2_addend[i] or 0) if a is not None and b is not None else None
+        for i, (a, b) in enumerate(zip(commission, opex))
+    )
+    out["Total Overheads"] = tuple(lakhs_to_cr(v) for v in overheads)
 
     out["Investment Yield"] = extract_investment_yield(pdf_path)
 

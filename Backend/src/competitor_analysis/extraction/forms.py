@@ -498,6 +498,15 @@ def get_line_item_from_text(text, *label_substrings, cur_col=None, prior_col=Non
             # is collapsed - a genuine separate figure never begins with
             # either, so this cannot merge two real numbers.
             rest = re.sub(r"(\d)\s+([.,]\d)", r"\1\2", rest)
+            # Same artifact, a different split point: pdfplumber occasionally
+            # splits a 3+ digit integer part right after its FIRST digit, e.g.
+            # "112.02" -> "1 12.02", "686.32" -> "6 86.32" (seen on Narayana's
+            # NL-2 TOTAL (B) row). Only collapsed when the leading digit isn't
+            # itself preceded by another digit (i.e. it's a lone single-digit
+            # token, not already part of a longer number) - a genuine separate
+            # earlier column ending "...5" immediately followed by another
+            # column "12.02" is not touched.
+            rest = re.sub(r"(?<!\d)(\d)\s+(\d{1,3}\.\d)", r"\1\2", rest)
             tokens = _NUM_TOKEN.findall(rest)
             vals = [parse_num(t) for t in tokens]
             cur = vals[cur_col] if cur_col < len(vals) else None
@@ -549,6 +558,55 @@ def get_line_item(fp: FormPage, *label_substrings, cur_year_frag=None, prior_yea
             if v is not None and (prior_val is None or v != 0):
                 prior_val = v
     return cur_val, prior_val
+
+
+def sum_rows_after(fp: FormPage, anchor_substrings, stop_pattern, table_idx=None,
+                    cur_year_frag=None, prior_year_frag=None):
+    """Sum every sub-item row's (current, prior) cumulative values nested
+    under a GROUP header row - a row that names the group (e.g. NL-2's "(f)
+    Contribution to Policyholders' A/c") but carries no values of its own,
+    with the actual figures spread across several immediately-following
+    sub-rows (e.g. "(i) Towards Excess Expenses of Management", "(ii) Towards
+    remuneration of MD/CEO/WTD/Other KMPs", "(iii) Others" - any of which may
+    be the only one populated in a given quarter, so summing just one by name
+    silently drops whichever one actually carries the value that quarter).
+
+    Sums every row after the anchor until a row whose label matches
+    `stop_pattern` (the next top-level lettered item, or a TOTAL row) is
+    reached. Returns (None, None) if the anchor isn't found or no sub-row
+    carried a parseable value for a period."""
+    if cur_year_frag is None or prior_year_frag is None:
+        _cur, _prior = year_frags()
+        cur_year_frag = cur_year_frag or _cur
+        prior_year_frag = prior_year_frag or _prior
+    matches = fp.find_rows(*anchor_substrings, table_idx=table_idx)
+    if not matches:
+        return None, None
+    _, ti, anchor_ridx = matches[0]
+    table = fp.tables[ti]
+    events = fp._events(ti)
+    cur_total = prior_total = 0.0
+    found = False
+    for r in range(anchor_ridx + 1, len(table)):
+        label = next((c for c in table[r] if c), None)
+        if label and stop_pattern.search(" ".join(str(label).split())):
+            break
+        cur_idx, cur_hdr_ridx = _col_for(events, r, cur_year_frag)
+        prior_idx, prior_hdr_ridx = _col_for(events, r, prior_year_frag)
+        cur_idx = _extend_to_total_column(table, cur_hdr_ridx, cur_idx)
+        prior_idx = _extend_to_total_column(table, prior_hdr_ridx, prior_idx)
+        row = table[r]
+        if cur_idx is not None and cur_idx < len(row):
+            v = parse_num(row[cur_idx])
+            if v is not None:
+                cur_total += v
+                found = True
+        if prior_idx is not None and prior_idx < len(row):
+            v = parse_num(row[prior_idx])
+            if v is not None:
+                prior_total += v
+                found = True
+    return (cur_total, prior_total) if found else (None, None)
 
 
 def get_single_value(fp: FormPage, *label_substrings):
