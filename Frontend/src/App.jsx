@@ -144,11 +144,30 @@ export default function App() {
   // phases/runId with the NEW period's name instead of offering a fresh
   // choice. Skipped on the very first render so it doesn't clobber the
   // run-reattachment effect above.
+  //
+  // Clearing the local runId alone isn't enough - the backend's one-run-at-
+  // a-time guard doesn't know the user has moved on, so it still refuses a
+  // new run "already in progress" until the old one is explicitly cancelled.
   const isFirstPeriodRender = useRef(true);
   useEffect(() => {
     if (isFirstPeriodRender.current) {
       isFirstPeriodRender.current = false;
       return;
+    }
+    const previousRunId = runId;
+    if (previousRunId) {
+      API.cancelRun(previousRunId).catch((e) => {
+        if (e.status === 409) {
+          toast({
+            kind: "error",
+            title: "Previous run still active",
+            description: "The run from the previous period is still executing in the "
+              + "background and can't be cancelled - wait for it to finish or fail "
+              + "before starting a new one.",
+          });
+        }
+        // Otherwise (404, or already in a terminal state) - nothing to do.
+      });
     }
     setRunId(null);
     setRunning(false);
@@ -161,8 +180,8 @@ export default function App() {
     setElapsed(0);
     setActivity([{ level: "info", text: `Switched to ${fy} ${quarter}.`, time: nowTime() }]);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- deliberately
-    // NOT keyed on companyList: this must fire only on an actual fy/quarter
-    // change, not whenever the company list reference happens to update.
+    // NOT keyed on companyList/runId/toast: this must fire only on an actual
+    // fy/quarter change, reading whatever those held at that moment.
   }, [fy, quarter]);
 
   // -- apply a status snapshot ----------------------------------------------

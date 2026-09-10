@@ -325,6 +325,25 @@ def continue_report(run_id: str):
     return _serialise_run(run)
 
 
+@app.post("/api/pipeline/{run_id}/cancel")
+def cancel_run(run_id: str):
+    """Abandon a run paused waiting for a human (awaiting_review,
+    awaiting_report) or not yet started (queued), freeing the registry so a
+    new run can start - e.g. the dashboard calls this when the user switches
+    to a different FY/Quarter without continuing the run they'd started.
+    Refuses (409) if the run's background thread is actively executing right
+    now, since it writes to files shared across every period."""
+    if REGISTRY.get(run_id) is None:
+        raise HTTPException(status_code=404, detail=f"No such run: {run_id}")
+    try:
+        run = REGISTRY.cancel(run_id)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return _serialise_run(run)
+
+
 # ---------------------------------------------------------------------------
 # Phase 1 document review
 #

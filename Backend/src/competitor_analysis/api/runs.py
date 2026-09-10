@@ -229,6 +229,32 @@ class RunRegistry:
                         f"Upload each source's file, then continue to extraction.")
         return run
 
+    def cancel(self, run_id: str) -> RunState:
+        """Abandon a run that's paused waiting for a human (awaiting_review,
+        awaiting_report) or hasn't started its background thread yet
+        (queued), freeing the registry for a new run to start - e.g. the
+        dashboard calls this when the user switches to a different
+        FY/Quarter without continuing whatever they'd started.
+
+        Refuses to cancel a run with status "running": that means a
+        background thread is actively executing right now, writing to files
+        shared across every period (the Data Engine workbook, the pdf/gemini
+        caches) - see start()'s docstring. Letting a new run start while
+        that thread is still mid-write would risk corrupting output neither
+        run intended, so the caller has to wait for it to finish or fail."""
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise KeyError(f"No such run: {run_id}")
+            if run.status == "running":
+                raise RuntimeError(
+                    "This run is actively executing and can't be cancelled safely - "
+                    "wait for it to finish or fail, then try again.")
+            if run.status in ("queued", "awaiting_review", "awaiting_report"):
+                run.status = "cancelled"
+                run.log("info", "Run cancelled.")
+        return run
+
     def continue_build(self, run_id: str) -> RunState:
         """Resume a run that paused after Phase 1 for document review, now
         running Phase 2 (extraction) against whatever is on disk - including

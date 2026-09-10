@@ -124,6 +124,12 @@ export const API = {
    * reporting. Same run id, not a new run. */
   continueToReport: (runId) => request(`/pipeline/${runId}/continue-report`, { method: "POST" }),
 
+  /** Abandon a run paused waiting for a human, or not yet started, freeing
+   * the backend to accept a new run - e.g. the user switched FY/Quarter
+   * without continuing what they'd started. Rejected (409) if the run's
+   * background thread is actively executing right now. */
+  cancelRun: (runId) => request(`/pipeline/${runId}/cancel`, { method: "POST" }),
+
   // -- Phase 1 document review ----------------------------------------------
   // A downloaded (or manually uploaded) source file, viewable while a run is
   // paused after retrieval - or at any other time, since viewing is read-only.
