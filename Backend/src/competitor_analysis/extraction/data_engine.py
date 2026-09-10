@@ -1378,13 +1378,20 @@ def compute_derived_metrics(company, regrouped, kind_by_key, income):
 
 
 def prefetch_income_statements(companies, max_workers=PDF_PARSE_MAX_WORKERS,
-                               on_company_done=None):
+                               on_company_done=None, should_cancel=None):
     """Stage 2's per-company PDF extraction, run concurrently.
 
     Independent per company and I/O/CPU-bound in pdfplumber, so a thread pool
     is enough; results land in the same cache the sequential path used, so the
-    sheet-writing stage is unchanged."""
+    sheet-writing stage is unchanged.
+
+    `should_cancel()`, if given, is checked after each company finishes -
+    a worker thread already running a parse can't be interrupted (Python
+    can't safely kill a thread), so cancelling here only stops the REMAINING
+    not-yet-started ones (via Future.cancel(), which drops anything still
+    queued) rather than waiting for every company to finish first."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    from competitor_analysis.cancellation import PipelineCancelled
     todo = [c for c in companies if c not in apply_income_statement_rows._cache]
     if not todo:
         return {}
@@ -1408,6 +1415,7 @@ def prefetch_income_statements(companies, max_workers=PDF_PARSE_MAX_WORKERS,
         # company that finished early would not be reported until every
         # company queued ahead of it had also finished - which is what made
         # the progress UI look like it updated all at once at the end.
+        cancelled = False
         for fut in as_completed(futures):
             company, result, error = fut.result()
             apply_income_statement_rows._cache[company] = result
@@ -1416,24 +1424,39 @@ def prefetch_income_statements(companies, max_workers=PDF_PARSE_MAX_WORKERS,
                 print(f"  ! {company}: skipped - {error}")
             if on_company_done is not None:
                 on_company_done(company)
+            if not cancelled and should_cancel is not None and should_cancel():
+                cancelled = True
+                for f in futures:
+                    f.cancel()  # no-op for ones already running/done
+        if cancelled:
+            raise PipelineCancelled()
     return errors
 
 
-def prefetch_gemini_metrics(companies, on_company_done=None):
+def prefetch_gemini_metrics(companies, on_company_done=None, should_cancel=None):
     """Stage 3's model calls for ALL companies, issued concurrently under one
     shared concurrency gate, instead of company-by-company then batch-by-batch.
 
     Only the network calls are parallel - every worksheet write still happens
-    sequentially afterwards, since openpyxl is not thread-safe."""
+    sequentially afterwards, since openpyxl is not thread-safe.
+
+    `should_cancel()`, if given, is polled every 0.4s while the model calls
+    are in flight (this stage alone can run tens of minutes - see
+    pipeline.py's Stage 3 comment) - and cancels them at the next await point
+    the moment it returns True, rather than waiting for the whole batch."""
     specs = gemini_extract.master_metric_specs()
     jobs = [(c, COMPANY_FULL_NAME[c], gemini_extract.COMPANY_PDFS[c]) for c in companies]
     n_batches = -(-len(specs) // gemini_extract.DEFAULT_BATCH_SIZE)
     print(f"[Gemini]          prefetching {len(specs)} metrics x {len(jobs)} companies "
           f"({n_batches * len(jobs)} calls, up to "
           f"{gemini_extract.MAX_CONCURRENT_GEMINI} concurrent)...")
-    results = asyncio.run(gemini_extract.extract_many_companies_async(
-        jobs, specs, all_forms=gemini_extract.ALL_FORMS,
-        on_company_done=on_company_done))
+    coro = gemini_extract.extract_many_companies_async(
+        jobs, specs, all_forms=gemini_extract.ALL_FORMS, on_company_done=on_company_done)
+    if should_cancel is not None:
+        from competitor_analysis.cancellation import run_cancellable
+        results = run_cancellable(coro, should_cancel)
+    else:
+        results = asyncio.run(coro)
     apply_company_gemini_pipeline._raw_cache.update(
         {c: r for c, r in results.items() if r})
     return results

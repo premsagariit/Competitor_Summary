@@ -232,10 +232,12 @@ export default function App() {
           });
           return; // stop polling until the reviewer continues
         }
-        if (snap.status === "completed" || snap.status === "failed") {
+        if (snap.status === "completed" || snap.status === "failed" || snap.status === "cancelled") {
           setRunning(false);
           if (snap.status === "failed") {
             toast({ kind: "error", title: "Pipeline failed", description: snap.error || "See the activity log." });
+          } else if (snap.status === "cancelled") {
+            toast({ kind: "info", title: "Pipeline ended", description: "The run was stopped." });
           } else {
             toast({ kind: "success", title: "Pipeline complete", description: "Report is ready for export" });
           }
@@ -338,6 +340,31 @@ export default function App() {
       });
       log("error", e.message);
       if (e.status === 0) setBackend({ status: "offline", detail: e.message });
+    }
+  }
+
+  // Ends the current run, wherever it is - paused (queued/awaiting_review/
+  // awaiting_report) cancels immediately; actively running just flags it and
+  // the backend stops at the next safe checkpoint (a moment later, not
+  // instant), so the poll loop is left running to pick up that transition
+  // rather than being torn down here.
+  async function endPipeline() {
+    if (!runId) return;
+    try {
+      const snap = await API.cancelRun(runId);
+      applySnapshot(snap);
+      if (snap.status === "cancelled") {
+        setRunning(false);
+        toast({ kind: "info", title: "Pipeline ended", description: "The run was stopped." });
+      } else {
+        toast({
+          kind: "info",
+          title: "Stopping…",
+          description: "The pipeline will stop at the next safe point - this may take a moment.",
+        });
+      }
+    } catch (e) {
+      toast({ kind: "error", title: "Could not end pipeline", description: e.message });
     }
   }
 
@@ -650,6 +677,12 @@ export default function App() {
               <Button variant="ghost" onClick={loadMetadata}>
                 <AppIcon name="refresh" className="w-4 h-4" />
                 Retry
+              </Button>
+            )}
+            {runId && !["completed", "failed", "cancelled", "idle"].includes(runStatus) && (
+              <Button variant="danger" onClick={endPipeline}>
+                <AppIcon name="x" className="w-4 h-4" />
+                End Pipeline
               </Button>
             )}
             <Button variant="ghost" onClick={runBuildOnly} disabled={running || backend.status !== "online"}>

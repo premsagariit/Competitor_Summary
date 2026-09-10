@@ -80,6 +80,12 @@ class RunState:
     stages: tuple = ("download", "build")
     selected_companies: frozenset | None = None
     prewarm: threading.Thread | None = field(default=None, repr=False)
+    # Set by RunRegistry.cancel() while a background thread is actively
+    # executing this run; checked cooperatively at safe points throughout
+    # _execute() and the phase functions, which raise PipelineCancelled once
+    # they see it rather than being killed outright (Python can't safely
+    # force-stop a running thread).
+    cancel_requested: bool = False
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def log(self, level: str, text: str):
@@ -230,27 +236,31 @@ class RunRegistry:
         return run
 
     def cancel(self, run_id: str) -> RunState:
-        """Abandon a run that's paused waiting for a human (awaiting_review,
-        awaiting_report) or hasn't started its background thread yet
-        (queued), freeing the registry for a new run to start - e.g. the
-        dashboard calls this when the user switches to a different
-        FY/Quarter without continuing whatever they'd started.
+        """Abandon a run - e.g. the dashboard's "End Pipeline" button, or a
+        FY/Quarter change abandoning whatever the user had started.
 
-        Refuses to cancel a run with status "running": that means a
-        background thread is actively executing right now, writing to files
-        shared across every period (the Data Engine workbook, the pdf/gemini
-        caches) - see start()'s docstring. Letting a new run start while
-        that thread is still mid-write would risk corrupting output neither
-        run intended, so the caller has to wait for it to finish or fail."""
+        A run paused waiting for a human (awaiting_review, awaiting_report)
+        or not yet started (queued) is cancelled immediately - no thread is
+        touching shared files at that moment, so it's always safe.
+
+        A run with status "running" has a background thread actively
+        executing right now. It can't be killed outright (Python can't
+        safely force-stop a running thread), so this only flags
+        `cancel_requested` for that thread to notice cooperatively - at the
+        next await point inside a network/LLM call (Phase 1's retrieval,
+        Phase 2's Gemini metrics) or between companies in whichever stage is
+        running (Phase 2's PDF parse). The run stays "running" until the
+        thread itself sees the flag and transitions to "cancelled" (see
+        _execute()'s PipelineCancelled handling) - not an immediate stop,
+        but no slower than the current unit of work already in flight."""
         with self._lock:
             run = self._runs.get(run_id)
             if run is None:
                 raise KeyError(f"No such run: {run_id}")
             if run.status == "running":
-                raise RuntimeError(
-                    "This run is actively executing and can't be cancelled safely - "
-                    "wait for it to finish or fail, then try again.")
-            if run.status in ("queued", "awaiting_review", "awaiting_report"):
+                run.cancel_requested = True
+                run.log("info", "Cancellation requested - stopping at the next safe point.")
+            elif run.status in ("queued", "awaiting_review", "awaiting_report"):
                 run.status = "cancelled"
                 run.log("info", "Run cancelled.")
         return run
@@ -356,6 +366,12 @@ def _execute(run: RunState, stages: tuple):
     review point and its continuation are one run to the API and the
     dashboard, not several.
     """
+    from competitor_analysis.cancellation import PipelineCancelled
+
+    def _check_cancel():
+        if run.cancel_requested:
+            raise PipelineCancelled()
+
     stream = _ActivityStream(run)
     run.status = "running"
     run.log("info", f"Run {run.run_id}: running {'/'.join(stages)}.")
@@ -363,6 +379,7 @@ def _execute(run: RunState, stages: tuple):
         with redirect_stdout(stream), redirect_stderr(stream):
             cfg.set_period(run.fy, run.quarter)
             retrieval_phase = next(p for p in run.phases if p.key == "retrieval")
+            _check_cancel()
             if "download" in stages:
                 _phase_retrieval(run)
             elif retrieval_phase.status == "pending":
@@ -374,8 +391,10 @@ def _execute(run: RunState, stages: tuple):
                 # "done" there, so it's a no-op.
                 run.set_phase("retrieval", "skipped")
                 _sync_retrieval_from_disk(run)
+            _check_cancel()
             if "build" in stages:
                 _phase_extraction(run)
+            _check_cancel()
             if "report" in stages:
                 _phase_reporting(run)
         if "report" in stages:
@@ -403,6 +422,12 @@ def _execute(run: RunState, stages: tuple):
             run.status = "awaiting_review"
             run.log("info", "Documents retrieved. Review them, then continue "
                             "to extraction.")
+    except PipelineCancelled:
+        run.status = "cancelled"
+        running = [p for p in run.phases if p.status == "running"]
+        for p in running:
+            p.status = "cancelled"
+        run.log("info", "Run cancelled.")
     except Exception as e:
         run.status = "failed"
         run.error = f"{type(e).__name__}: {e}"
@@ -426,7 +451,7 @@ def _execute(run: RunState, stages: tuple):
         # Not set on "awaiting_review"/"awaiting_report": the run isn't over,
         # it's paused, so elapsed keeps ticking (and a later continue can
         # still fail/finish).
-        if run.status in ("completed", "failed"):
+        if run.status in ("completed", "failed", "cancelled"):
             run.finished_at = time.time()
         # Runs also pause at "awaiting_review"/"awaiting_report" with real
         # files already on disk, so sync regardless of which state this run
@@ -513,7 +538,9 @@ def _fetch_sources(run: RunState, target_keys: list[str] | None):
     watcher = threading.Thread(target=watch, daemon=True)
     watcher.start()
     try:
-        asyncio.run(scraper.main(run.fy, run.quarter, companies=target_keys))
+        from competitor_analysis.cancellation import run_cancellable
+        run_cancellable(scraper.main(run.fy, run.quarter, companies=target_keys),
+                        lambda: run.cancel_requested)
     finally:
         stop.set()
         watcher.join(timeout=2)
@@ -752,7 +779,8 @@ def _phase_extraction(run: RunState):
 
     pipeline_mod.run_phase2(ws, companies=runnable,
                             run_gic=gic_available and gic_selected,
-                            on_progress=_on_progress)
+                            on_progress=_on_progress,
+                            should_cancel=lambda: run.cancel_requested)
 
     engine_path = cfg.data_engine_output_path()
     paths.ensure_parent(engine_path)

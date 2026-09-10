@@ -28,7 +28,7 @@ from competitor_analysis.extraction import gemini as gemini_extract
 from competitor_analysis.extraction import data_engine as p
 
 
-def run_phase2(ws, companies=None, run_gic=True, on_progress=None):
+def run_phase2(ws, companies=None, run_gic=True, on_progress=None, should_cancel=None):
     """Runs Phase 2's 4 stages against an already-loaded worksheet. Does NOT
     load/save the workbook - callers own that.
 
@@ -36,8 +36,21 @@ def run_phase2(ws, companies=None, run_gic=True, on_progress=None):
     per-company work lands, so a caller driving a UI can show real movement
     instead of everything jumping to 100% at the end. `key` is a company key
     or "GIC". The three milestones are weighted by how long each actually
-    takes: the PDF parse dominates, so it carries most of the bar."""
+    takes: the PDF parse dominates, so it carries most of the bar.
+
+    `should_cancel()`, if given, is checked between companies in every stage
+    that has one (the PDF-parse and Gemini prefetches also check it
+    themselves, between whichever of their concurrent units finish first) -
+    raises PipelineCancelled the moment it returns True, so a run being
+    stopped doesn't have to wait for every remaining company to finish."""
+    from competitor_analysis.cancellation import PipelineCancelled
+
+    def _check_cancel():
+        if should_cancel is not None and should_cancel():
+            raise PipelineCancelled()
+
     t_start = time.time()
+    _check_cancel()
 
     def progress(key, percent, status=None):
         if on_progress is not None:
@@ -73,7 +86,8 @@ def run_phase2(ws, companies=None, run_gic=True, on_progress=None):
     t0 = time.time()
     print(f"[Income Statement] extracting {len(companies)} companies concurrently ...")
     mem_skipped = p.prefetch_income_statements(
-        companies, on_company_done=lambda c: progress(c, 60, "extracting"))
+        companies, on_company_done=lambda c: progress(c, 60, "extracting"),
+        should_cancel=should_cancel)
     t_inc_extract = time.time() - t0
     if mem_skipped:
         # Not fatal by design: the container's memory budget was reached
@@ -99,7 +113,8 @@ def run_phase2(ws, companies=None, run_gic=True, on_progress=None):
     # writes, which is fast and must stay serial (openpyxl isn't thread-safe).
     t0 = time.time()
     p.prefetch_gemini_metrics(
-        companies, on_company_done=lambda c: progress(c, 85, "extracting"))
+        companies, on_company_done=lambda c: progress(c, 85, "extracting"),
+        should_cancel=should_cancel)
     t_fetch = time.time() - t0
     hits, misses = gemini_extract.CACHE_STATS["hit"], gemini_extract.CACHE_STATS["miss"]
     print(f"[Gemini]          extraction done  -  {t_fetch:.1f}s total "
@@ -107,6 +122,7 @@ def run_phase2(ws, companies=None, run_gic=True, on_progress=None):
 
     failed = {}
     for company in companies:
+        _check_cancel()
         t0 = time.time()
         try:
             written, log, raw = p.apply_company_gemini_pipeline(ws, company)
