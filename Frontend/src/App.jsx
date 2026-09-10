@@ -136,6 +136,35 @@ export default function App() {
     };
   }, [backend.status, log]);
 
+  // Switching the reporting period abandons whatever run-state belonged to
+  // the previously selected period (e.g. a manual-upload run left at
+  // retrieval "skipped") - without this, the FY/Quarter selects stay
+  // enabled after a manual-upload start (nothing sets `running` true for
+  // that path) and changing them just relabels the OLD period's leftover
+  // phases/runId with the NEW period's name instead of offering a fresh
+  // choice. Skipped on the very first render so it doesn't clobber the
+  // run-reattachment effect above.
+  const isFirstPeriodRender = useRef(true);
+  useEffect(() => {
+    if (isFirstPeriodRender.current) {
+      isFirstPeriodRender.current = false;
+      return;
+    }
+    setRunId(null);
+    setRunning(false);
+    setRunStatus("idle");
+    setPhases(EMPTY_PHASES);
+    setCompanies(idleCompanies(companyList));
+    setReportProgress(0);
+    setReportReady(false);
+    setDataEngineReady(false);
+    setElapsed(0);
+    setActivity([{ level: "info", text: `Switched to ${fy} ${quarter}.`, time: nowTime() }]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- deliberately
+    // NOT keyed on companyList: this must fire only on an actual fy/quarter
+    // change, not whenever the company list reference happens to update.
+  }, [fy, quarter]);
+
   // -- apply a status snapshot ----------------------------------------------
   const applySnapshot = useCallback((snap) => {
     setPhases(
