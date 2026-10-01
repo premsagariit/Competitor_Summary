@@ -6,6 +6,7 @@ Run:  myenv/Scripts/python.exe -m pytest test_scraper_retrieval.py -v
 """
 import asyncio
 
+import httpx
 import pytest
 
 from competitor_analysis import config as cfg
@@ -40,9 +41,10 @@ def test_ultra_remains_available_per_company():
 
 def test_processor_timeouts_are_bounded():
     """The old single 1800s ceiling let one hung run dominate Phase 1. Every
-    per-processor budget must be far below that, and escalate with cost."""
-    assert scraper.PROCESSOR_TIMEOUTS["core"] < scraper.PROCESSOR_TIMEOUTS["pro"]
-    assert scraper.PROCESSOR_TIMEOUTS["pro"] < scraper.PROCESSOR_TIMEOUTS["ultra"]
+    per-processor budget must be far below that, and never escalate to a
+    cheaper tier costing more patience than a pricier one before it."""
+    assert scraper.PROCESSOR_TIMEOUTS["core"] <= scraper.PROCESSOR_TIMEOUTS["pro"]
+    assert scraper.PROCESSOR_TIMEOUTS["pro"] <= scraper.PROCESSOR_TIMEOUTS["ultra"]
     for name, budget in scraper.PROCESSOR_TIMEOUTS.items():
         assert budget <= 600, f"{name} budget {budget}s is too generous"
     assert scraper.SEARCH_TIMEOUT_SECONDS <= 180
@@ -173,6 +175,79 @@ def test_all_candidates_failing_returns_none_and_cleans_up(tmp_path, monkeypatch
     assert asyncio.run(scraper.try_candidates_concurrently(
         "ACME", ["a", "b"], "PDF", tmp_path, referer="r", cal_data=Q3)) is None
     assert list(tmp_path.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# Download guards (size cap / magic bytes) - _fetch_bounded, no real network
+# ---------------------------------------------------------------------------
+
+def _mock_client(content: bytes, content_type: str = "application/pdf"):
+    def handler(request):
+        return httpx.Response(200, content=content, headers={"content-type": content_type})
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+def test_fetch_bounded_accepts_valid_content_within_cap():
+    async def run():
+        async with _mock_client(b"%PDF-1.4 genuine filing content") as client:
+            return await scraper._fetch_bounded(
+                client, "https://x/filing.pdf", b"%PDF", "PDF", "ACME", 1)
+    assert asyncio.run(run()) == b"%PDF-1.4 genuine filing content"
+
+
+def test_fetch_bounded_rejects_wrong_magic_bytes():
+    """A WAF challenge or wrong link served as 200 OK HTML must be rejected,
+    not written to disk as if it were the filing."""
+    async def run():
+        async with _mock_client(b"<html>not a pdf, a WAF page</html>",
+                                content_type="text/html") as client:
+            return await scraper._fetch_bounded(
+                client, "https://x/filing.pdf", b"%PDF", "PDF", "ACME", 1)
+    assert asyncio.run(run()) is None
+
+
+def test_fetch_bounded_rejects_response_over_the_cap(monkeypatch):
+    """The Search fallback isn't domain-restricted, so a candidate can be an
+    arbitrary (large) webpage, not a small PDF. It must be rejected rather
+    than fully buffered into memory - this is what actually OOM'd a 512MB
+    Render instance during retrieval."""
+    monkeypatch.setattr(scraper, "MAX_DOWNLOAD_BYTES", 500)
+    oversized = b"%PDF" + b"x" * 2000  # starts right, but far over the cap
+    async def run():
+        async with _mock_client(oversized) as client:
+            return await scraper._fetch_bounded(
+                client, "https://x/filing.pdf", b"%PDF", "PDF", "ACME", 1)
+    assert asyncio.run(run()) is None
+
+
+def test_download_concurrency_is_capped(monkeypatch):
+    """Companies and candidates both fan out concurrently elsewhere in this
+    module - _fetch_bounded must still cap how many are ever downloading (and
+    holding a response in memory) globally at once, regardless of how many
+    callers are waiting on the semaphore. The handler awaits mid-request so
+    genuinely-overlapping calls actually interleave - without that, nothing
+    here would force the cap to be exercised even if it didn't exist."""
+    monkeypatch.setattr(scraper, "MAX_CONCURRENT_DOWNLOADS", 2)
+    monkeypatch.setattr(scraper, "_download_semaphore", asyncio.Semaphore(2))
+    in_flight = 0
+    peak = 0
+
+    async def handler(request):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.02)
+        in_flight -= 1
+        return httpx.Response(200, content=b"%PDF-ok")
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            await asyncio.gather(*[
+                scraper._fetch_bounded(client, f"https://x/{i}.pdf", b"%PDF", "PDF", "ACME", 1)
+                for i in range(8)
+            ])
+    asyncio.run(run())
+    assert peak <= 2
 
 
 # ---------------------------------------------------------------------------

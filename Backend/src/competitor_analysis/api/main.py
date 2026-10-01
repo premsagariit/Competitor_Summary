@@ -7,6 +7,7 @@ the UI's views did not need restructuring to consume real data.
 Run:
     uvicorn competitor_analysis.api.main:app --reload --port 8000
 """
+import asyncio
 import os
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -15,10 +16,13 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from competitor_analysis import config as cfg
+from competitor_analysis import logging_setup
 from competitor_analysis import paths
 from competitor_analysis.api import runs as runs_mod
 from competitor_analysis.api.runs import REGISTRY
-from competitor_analysis.storage import r2
+from competitor_analysis.storage import s3
+
+logging_setup.configure()
 
 app = FastAPI(
     title="Competitor Analysis API",
@@ -46,8 +50,8 @@ app.add_middleware(
 @app.on_event("startup")
 def _restore_documents_from_r2():
     """Pull previously-synced downloads/reports back onto local disk. A
-    no-op when R2 isn't configured (plain local dev)."""
-    r2.restore_all()
+    no-op when S3 isn't configured (plain local dev)."""
+    s3.restore_all()
 
 # Derived from the clock, newest first - no annual edit needed. A caller may
 # also POST any other financial year; /api/pipeline/run normalises whatever
@@ -356,6 +360,42 @@ def cancel_run(run_id: str):
 # ---------------------------------------------------------------------------
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # a regulatory filing runs a few MB; this only guards against a mistaken upload
+UPLOAD_CHUNK_BYTES = 1024 * 1024  # bounds peak memory per upload regardless of file size
+
+
+async def _stream_upload_to_disk(file: UploadFile, dest: str, validate=None) -> int:
+    """Write an uploaded file to `dest` a chunk at a time instead of
+    `await file.read()`-ing the whole thing into one `bytes` object first -
+    on Render's 512MB free-tier cap, buffering a near-50MB upload plus
+    everything else already in memory is the kind of thing that OOMs the
+    container. Streams into a sibling temp file and only replaces `dest`
+    (atomically, via os.replace) once the full upload has landed, passed the
+    size check, and passed `validate` (if given) - a failed/oversized/invalid
+    upload never leaves a corrupt file in `dest`'s place. `validate`, if
+    given, is called with the temp file's path and should raise
+    HTTPException(400) on a bad file. Returns the final size in bytes."""
+    # Extension preserved (not just appended) because validators like
+    # openpyxl's infer file format from the filename - `dest + ".uploading"`
+    # would make a perfectly valid .xlsx look like an unsupported format.
+    root, ext = os.path.splitext(dest)
+    tmp_path = f"{root}.uploading{ext}"
+    size = 0
+    try:
+        with open(tmp_path, "wb") as f:
+            while chunk := await file.read(UPLOAD_CHUNK_BYTES):
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=400, detail="File too large (limit 50 MB).")
+                f.write(chunk)
+        if size == 0:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+        if validate is not None:
+            validate(tmp_path)
+        os.replace(tmp_path, dest)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    return size
 
 
 def _resolve_company_file(run, company_id: str):
@@ -402,12 +442,12 @@ def delete_downloaded_file(run_id: str, company_id: str):
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail=f"No downloaded file for {cs.name} to remove.")
     os.remove(path)
-    r2.delete_file(path)
+    s3.delete_file(path)
     cs.retrieval_status = "missing"
     cs.retrieval_progress = 0
     cs.size = None
     cs.tier = None
-    run.log("warn", f"{cs.name}: downloaded file removed for review.")
+    run.log("warning", f"{cs.name}: downloaded file removed for review.")
     return _serialise_run(run)
 
 
@@ -424,20 +464,21 @@ async def upload_downloaded_file(run_id: str, company_id: str, file: UploadFile 
         raise HTTPException(
             status_code=400,
             detail=f"{cs.name} expects a {expected_ext} file, got {uploaded_ext}.")
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=400, detail="File too large (limit 50 MB).")
     paths.ensure_parent(path)
-    with open(path, "wb") as f:
-        f.write(content)
-    r2.upload_file(path)
+    size = await _stream_upload_to_disk(file, path)
+    # s3.upload_file is a blocking network call (boto3); this endpoint is
+    # async (it awaits file.read()), so FastAPI does NOT run it in a
+    # threadpool the way it does for plain `def` endpoints - calling the
+    # blocking upload directly here would stall the single asyncio event
+    # loop for the whole PUT, which behind Render's HTTP/2 edge proxy shows
+    # up client-side as net::ERR_HTTP2_PROTOCOL_ERROR instead of a normal
+    # slow response.
+    await asyncio.to_thread(s3.upload_file, path)
     cs.retrieval_status = "done"
     cs.retrieval_progress = 100
-    cs.size = len(content)
+    cs.size = size
     cs.tier = "manual"
-    run.log("success", f"{cs.name}: file uploaded manually for review ({len(content)} bytes).")
+    run.log("info", f"{cs.name}: file uploaded manually for review ({size} bytes).")
     return _serialise_run(run)
 
 
@@ -494,24 +535,24 @@ async def upload_data_engine(run_id: str, file: UploadFile = File(...)):
     if uploaded_ext and uploaded_ext != ".xlsx":
         raise HTTPException(status_code=400,
                             detail=f"Expected a .xlsx file, got {uploaded_ext}.")
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=400, detail="File too large (limit 50 MB).")
-    # A quick load (not just the extension) catches a corrupted or non-Excel
-    # file here, at upload time, rather than as a confusing failure deep
-    # inside report generation once continue-report reads it.
-    import io
-    import openpyxl
-    try:
-        openpyxl.load_workbook(io.BytesIO(content), read_only=True).close()
-    except Exception:
-        raise HTTPException(status_code=400,
-                            detail="Not a valid Excel (.xlsx) workbook.")
+    def _validate_xlsx(tmp_path: str) -> None:
+        # A quick load (not just the extension) catches a corrupted or
+        # non-Excel file here, at upload time, rather than as a confusing
+        # failure deep inside report generation once continue-report reads
+        # it. Reads from the temp file on disk, not an in-memory buffer, so
+        # this doesn't undo the point of streaming the upload to disk.
+        import openpyxl
+        try:
+            openpyxl.load_workbook(tmp_path, read_only=True).close()
+        except Exception:
+            raise HTTPException(status_code=400,
+                                detail="Not a valid Excel (.xlsx) workbook.")
+
     paths.ensure_parent(run.data_engine_path)
-    with open(run.data_engine_path, "wb") as f:
-        f.write(content)
-    r2.upload_file(run.data_engine_path)
-    run.log("success", f"Data Engine workbook replaced manually ({len(content)} bytes).")
+    size = await _stream_upload_to_disk(file, run.data_engine_path, validate=_validate_xlsx)
+    # See the matching comment in upload_downloaded_file: this is an async
+    # endpoint, so the blocking r2 upload must be offloaded or it stalls the
+    # event loop for the whole request.
+    await asyncio.to_thread(s3.upload_file, run.data_engine_path)
+    run.log("info", f"Data Engine workbook replaced manually ({size} bytes).")
     return _serialise_run(run)

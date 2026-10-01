@@ -24,6 +24,9 @@ import pdfplumber
 from competitor_analysis import config as cfg
 from competitor_analysis import memory
 from competitor_analysis import paths
+from competitor_analysis import logging_setup
+
+log = logging_setup.get_logger(__name__)
 
 CACHE_ROOT = str(paths.PDF_JSON_CACHE)
 
@@ -46,7 +49,7 @@ def discover_company_pdfs(fy: str = None, quarter: str = None,
         if os.path.exists(path):
             out[company] = path
         elif announce_missing:
-            print(f"[pdf_cache] {company}: PDF not found at {path} - skipping this insurer.")
+            log.warning("%s: PDF not found at %s - skipping this insurer.", company, path)
     return out
 
 
@@ -87,8 +90,7 @@ def refresh_company_pdfs():
     _PDF_TO_COMPANY.clear()
     _PDF_TO_COMPANY.update({os.path.normpath(v): k for k, v in fresh.items()})
     for company in missing:
-        print(f"[pdf_cache] {company}: PDF not found in {cfg.download_dir()} "
-              f"- skipping this insurer.")
+        log.warning("%s: PDF not found in %s - skipping this insurer.", company, cfg.download_dir())
     return COMPANY_PDFS
 
 
@@ -146,7 +148,7 @@ def _cache_path(company):
 def _content_fingerprint(pdf_path):
     """(sha256, size) of the source PDF - the cache's validity key.
 
-    Deliberately NOT mtime. The cache is synced to R2 and restored onto a
+    Deliberately NOT mtime. The cache is synced to S3 and restored onto a
     fresh container, and a download rewrites mtime to "now" even when the
     bytes are identical - so an mtime key discarded the restored cache
     immediately and re-parsed everything, defeating the sync. Content

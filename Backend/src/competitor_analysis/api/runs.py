@@ -15,17 +15,20 @@ means the corresponding artifact exists.
 # deferred (string) annotations sidestep this entirely.
 from __future__ import annotations
 
-import io
+import logging
 import threading
 import time
 import traceback
 import uuid
-from contextlib import redirect_stdout, redirect_stderr
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from competitor_analysis import config as cfg
+from competitor_analysis import logging_setup
 from competitor_analysis import paths
-from competitor_analysis.storage import r2
+from competitor_analysis.storage import s3
+
+log = logging_setup.get_logger(__name__)
 
 # Report sections, only used to give the reporting phase a progress
 # denominator. The PDF is built in one call, so this phase reports
@@ -109,44 +112,39 @@ class RunState:
         return round(end - self.started_at, 1)
 
 
-class _ActivityStream(io.TextIOBase):
-    """Routes the pipeline's own stdout into a run's activity feed.
+class ActivityLogHandler(logging.Handler):
+    """Feeds every `competitor_analysis.*` log record into one run's activity
+    feed, for as long as it's attached - see `_run_with_activity_log()`.
 
-    The pipeline is a print-heavy batch program; rather than silence it or
-    re-instrument every message, its output becomes the run's log. Lines the
-    pipeline already marks (`!` warnings, `Rejected`, `Giving up`) are
-    classified so the UI can colour them."""
+    Replaces an earlier version that redirected the pipeline's stdout (it was
+    print-heavy, with no structured level) and guessed a level from each
+    line's wording (`_classify`). Now that the pipeline logs via the
+    `logging` module, the level is the real one the code chose."""
 
     def __init__(self, run: RunState):
+        super().__init__()
         self._run = run
-        self._buf = ""
+        self.addFilter(logging_setup.PhaseFilter())
 
-    def write(self, s):
-        self._buf += s
-        while "\n" in self._buf:
-            line, self._buf = self._buf.split("\n", 1)
-            line = line.rstrip()
-            if line:
-                self._run.log(_classify(line), line)
-        return len(s)
-
-    def flush(self):
-        if self._buf.strip():
-            self._run.log(_classify(self._buf), self._buf.strip())
-            self._buf = ""
+    def emit(self, record: logging.LogRecord):
+        self._run.log(record.levelname.lower(), self.format(record))
 
 
-def _classify(line: str) -> str:
-    low = line.lower()
-    if any(t in low for t in ("giving up", "failed", "error", "traceback")):
-        return "error"
-    if any(t in low for t in (" ! ", "rejected", "discarded", "skipped",
-                              "rate-limited", "not found", "unmatched",
-                              "abandoned", "memory budget")):
-        return "warn"
-    if any(t in low for t in ("saved", "done", "complete", "wrote")):
-        return "success"
-    return "info"
+@contextmanager
+def _run_with_activity_log(run: RunState):
+    """Attaches an ActivityLogHandler to the shared pipeline logger for the
+    duration of the block, so every log.info/warning/error/critical call made
+    anywhere in the pipeline while a run executes lands in that run's
+    activity feed. Safe because RunRegistry only ever executes one run's
+    thread at a time."""
+    handler = ActivityLogHandler(run)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger = logging.getLogger("competitor_analysis")
+    logger.addHandler(handler)
+    try:
+        yield
+    finally:
+        logger.removeHandler(handler)
 
 
 class RunRegistry:
@@ -372,16 +370,20 @@ def _execute(run: RunState, stages: tuple):
         if run.cancel_requested:
             raise PipelineCancelled()
 
-    stream = _ActivityStream(run)
     run.status = "running"
-    run.log("info", f"Run {run.run_id}: running {'/'.join(stages)}.")
-    try:
-        with redirect_stdout(stream), redirect_stderr(stream):
+    # The handler wraps the try/except/finally too, not just the happy path:
+    # PipelineCancelled/Exception propagate out of a `with` block before an
+    # enclosing except sees them, which would detach the handler before the
+    # "Run cancelled."/"Run failed" lines below could reach the activity feed.
+    with _run_with_activity_log(run):
+        log.info("Run %s: running %s.", run.run_id, "/".join(stages))
+        try:
             cfg.set_period(run.fy, run.quarter)
             retrieval_phase = next(p for p in run.phases if p.key == "retrieval")
             _check_cancel()
             if "download" in stages:
-                _phase_retrieval(run)
+                with logging_setup.phase("Phase 1"):
+                    _phase_retrieval(run)
             elif retrieval_phase.status == "pending":
                 # "build" requested without "download" ever having run in this
                 # run (the standalone build-only entrypoint) - reflect
@@ -393,70 +395,69 @@ def _execute(run: RunState, stages: tuple):
                 _sync_retrieval_from_disk(run)
             _check_cancel()
             if "build" in stages:
-                _phase_extraction(run)
+                with logging_setup.phase("Phase 2"):
+                    _phase_extraction(run)
             _check_cancel()
             if "report" in stages:
-                _phase_reporting(run)
-        if "report" in stages:
-            run.status = "completed"
-            run.log("success", "Run completed.")
-        elif "build" in stages:
-            # Deliberately not "completed" - extraction finished, but the
-            # pipeline stops here so a human can review the filled Data
-            # Engine workbook (download it, and replace it by hand if
-            # something looks wrong) before the report is built from it.
-            run.status = "awaiting_report"
-            run.log("info", "Data Engine ready. Review it (download it, "
-                            "replace it if needed), then continue to report "
-                            "generation.")
-        else:
-            # Deliberately not "completed" - Phase 1 finished, but the
-            # pipeline stops here so a human can confirm the retrieved
-            # documents (or replace/remove/upload one) before extraction
-            # reads them.
-            # Started BEFORE the status flips: a client that sees
-            # awaiting_review may POST /continue immediately, and
-            # _phase_extraction has to be able to see this thread in order to
-            # join it rather than parse the same filings alongside it.
-            _start_parse_prewarm(run)
-            run.status = "awaiting_review"
-            run.log("info", "Documents retrieved. Review them, then continue "
-                            "to extraction.")
-    except PipelineCancelled:
-        run.status = "cancelled"
-        running = [p for p in run.phases if p.status == "running"]
-        for p in running:
-            p.status = "cancelled"
-        run.log("info", "Run cancelled.")
-    except Exception as e:
-        run.status = "failed"
-        run.error = f"{type(e).__name__}: {e}"
-        # Attribute the failure to the phase it happened in: whichever was
-        # running, or - if it raised before marking itself running - the first
-        # phase that had not yet completed. Leaving a phase "pending" on a
-        # failed run reads as "never attempted", which is wrong.
-        running = [p for p in run.phases if p.status == "running"]
-        if running:
+                with logging_setup.phase("Phase 3"):
+                    _phase_reporting(run)
+            if "report" in stages:
+                run.status = "completed"
+                log.info("Run completed.")
+            elif "build" in stages:
+                # Deliberately not "completed" - extraction finished, but the
+                # pipeline stops here so a human can review the filled Data
+                # Engine workbook (download it, and replace it by hand if
+                # something looks wrong) before the report is built from it.
+                run.status = "awaiting_report"
+                log.info("Data Engine ready. Review it (download it, "
+                         "replace it if needed), then continue to report generation.")
+            else:
+                # Deliberately not "completed" - Phase 1 finished, but the
+                # pipeline stops here so a human can confirm the retrieved
+                # documents (or replace/remove/upload one) before extraction
+                # reads them.
+                # Started BEFORE the status flips: a client that sees
+                # awaiting_review may POST /continue immediately, and
+                # _phase_extraction has to be able to see this thread in order to
+                # join it rather than parse the same filings alongside it.
+                _start_parse_prewarm(run)
+                run.status = "awaiting_review"
+                log.info("Documents retrieved. Review them, then continue to extraction.")
+        except PipelineCancelled:
+            run.status = "cancelled"
+            running = [p for p in run.phases if p.status == "running"]
             for p in running:
-                p.status = "failed"
-        else:
-            for p in run.phases:
-                if p.status not in ("done", "skipped"):
+                p.status = "cancelled"
+            log.info("Run cancelled.")
+        except Exception as e:
+            run.status = "failed"
+            run.error = f"{type(e).__name__}: {e}"
+            # Attribute the failure to the phase it happened in: whichever was
+            # running, or - if it raised before marking itself running - the first
+            # phase that had not yet completed. Leaving a phase "pending" on a
+            # failed run reads as "never attempted", which is wrong.
+            running = [p for p in run.phases if p.status == "running"]
+            if running:
+                for p in running:
                     p.status = "failed"
-                    break
-        run.log("error", f"Run failed: {run.error}")
-        run.log("error", traceback.format_exc(limit=6))
-    finally:
-        stream.flush()
-        # Not set on "awaiting_review"/"awaiting_report": the run isn't over,
-        # it's paused, so elapsed keeps ticking (and a later continue can
-        # still fail/finish).
-        if run.status in ("completed", "failed", "cancelled"):
-            run.finished_at = time.time()
-        # Runs also pause at "awaiting_review"/"awaiting_report" with real
-        # files already on disk, so sync regardless of which state this run
-        # landed in.
-        r2.sync_run_outputs()
+            else:
+                for p in run.phases:
+                    if p.status not in ("done", "skipped"):
+                        p.status = "failed"
+                        break
+            log.critical("Run failed: %s", run.error)
+            log.critical(traceback.format_exc(limit=6))
+        finally:
+            # Not set on "awaiting_review"/"awaiting_report": the run isn't over,
+            # it's paused, so elapsed keeps ticking (and a later continue can
+            # still fail/finish).
+            if run.status in ("completed", "failed", "cancelled"):
+                run.finished_at = time.time()
+            # Runs also pause at "awaiting_review"/"awaiting_report" with real
+            # files already on disk, so sync regardless of which state this run
+            # landed in.
+            s3.sync_run_outputs()
 
 
 # ---------------------------------------------------------------------------
@@ -562,7 +563,7 @@ def _phase_retrieval(run: RunState):
     from competitor_analysis.ingestion import scraper
 
     run.set_phase("retrieval", "running")
-    run.log("info", "Phase 1: retrieving filings from disclosure portals.")
+    log.info("Phase 1: retrieving filings from disclosure portals.")
     scraper.ATTEMPT_LOG.clear()
 
     all_keys = list(scraper.load_sources())
@@ -573,7 +574,7 @@ def _phase_retrieval(run: RunState):
         skipped = [c.name for c in run.companies.values()
                   if c.id not in run.selected_companies]
         if skipped:
-            run.log("info", f"Excluded from this run: {', '.join(skipped)}.")
+            log.info("Excluded from this run: %s.", ", ".join(skipped))
         for cs in run.companies.values():
             if cs.id not in run.selected_companies:
                 cs.retrieval_status, cs.retrieval_progress = "skipped", 0
@@ -584,8 +585,8 @@ def _phase_retrieval(run: RunState):
               if c.retrieval_status not in ("done", "skipped")]
     run.set_phase("retrieval", "done")
     if failed:
-        run.log("warn", f"{len(failed)} source(s) unavailable: {', '.join(failed)}. "
-                        f"The build continues with whatever landed.")
+        log.warning("%d source(s) unavailable: %s. The build continues with whatever landed.",
+                    len(failed), ", ".join(failed))
 
 
 def _execute_fetch_missing(run: RunState, companies: list[str] | None):
@@ -601,10 +602,9 @@ def _execute_fetch_missing(run: RunState, companies: list[str] | None):
     currently missing/failed source that's selected for this run."""
     from competitor_analysis.ingestion import scraper
 
-    stream = _ActivityStream(run)
     run.status = "running"
-    try:
-        with redirect_stdout(stream), redirect_stderr(stream):
+    with _run_with_activity_log(run), logging_setup.phase("Phase 1"):
+        try:
             cfg.set_period(run.fy, run.quarter)
             by_id = {_company_id(key): key for key in scraper.load_sources()}
             if companies is not None:
@@ -616,9 +616,9 @@ def _execute_fetch_missing(run: RunState, companies: list[str] | None):
                     and (run.selected_companies is None or cs.id in run.selected_companies)
                 ]
             if not target_keys:
-                run.log("info", "Nothing to fetch - every selected source already has a file.")
+                log.info("Nothing to fetch - every selected source already has a file.")
             else:
-                run.log("info", f"Fetching automatically: {', '.join(target_keys)}.")
+                log.info("Fetching automatically: %s.", ", ".join(target_keys))
                 run.set_phase("retrieval", "running")
                 scraper.ATTEMPT_LOG.clear()
                 _fetch_sources(run, target_keys)
@@ -627,15 +627,14 @@ def _execute_fetch_missing(run: RunState, companies: list[str] | None):
                                  if run.companies.get(_company_id(k), None) is None
                                  or run.companies[_company_id(k)].retrieval_status not in ("done", "skipped")]
                 if still_missing:
-                    run.log("warn", f"Still unavailable: {', '.join(still_missing)}.")
+                    log.warning("Still unavailable: %s.", ", ".join(still_missing))
                 else:
-                    run.log("success", "All requested sources fetched.")
-    except Exception as e:
-        run.log("error", f"Automatic fetch failed: {type(e).__name__}: {e}")
-    finally:
-        stream.flush()
-        run.status = "awaiting_review"
-        r2.sync_run_outputs()
+                    log.info("All requested sources fetched.")
+        except Exception as e:
+            log.error("Automatic fetch failed: %s: %s", type(e).__name__, e)
+        finally:
+            run.status = "awaiting_review"
+            s3.sync_run_outputs()
 
 
 def _start_parse_prewarm(run: RunState):
@@ -755,7 +754,7 @@ def _phase_extraction(run: RunState):
     # expensive way to waste a 0.1-CPU container. If review was instant this
     # returns almost immediately and the work simply happens below instead.
     if run.prewarm is not None and run.prewarm.is_alive():
-        run.log("info", "Waiting for the pre-parse started during review ...")
+        log.info("Waiting for the pre-parse started during review ...")
         run.prewarm.join()
 
     from competitor_analysis.extraction import pdf_cache
@@ -763,8 +762,8 @@ def _phase_extraction(run: RunState):
     runnable = [k for k in short_keys if k in pdf_cache.COMPANY_PDFS]
     missing_from_cache = sorted(set(short_keys) - set(runnable))
     if missing_from_cache:
-        run.log("warn", f"Present on disk but not registered for extraction: "
-                        f"{', '.join(missing_from_cache)}")
+        log.warning("Present on disk but not registered for extraction: %s",
+                    ", ".join(missing_from_cache))
 
     def _on_progress(key, percent, status=None):
         """Reflect one unit of per-company work onto the run snapshot the
@@ -786,7 +785,7 @@ def _phase_extraction(run: RunState):
     paths.ensure_parent(engine_path)
     wb.save(engine_path)
     run.data_engine_path = str(engine_path)
-    run.log("success", f"Data Engine written to {engine_path}")
+    log.info("Data Engine written to %s", engine_path)
 
     # Anything still mid-flight had no progress callback fire for it (a
     # company skipped inside run_phase2, say) - settle it here.
@@ -810,7 +809,7 @@ def _phase_reporting(run: RunState):
     run.report_path = str(out)
     run.report_progress = 100
     run.set_phase("reporting", "done")
-    run.log("success", f"Report written to {out}")
+    log.info("Report written to %s", out)
 
 
 REGISTRY = RunRegistry()

@@ -38,10 +38,13 @@ from google.genai import types
 
 from competitor_analysis import config as cfg
 from competitor_analysis import paths
+from competitor_analysis import logging_setup
 from competitor_analysis.extraction import gemini as gemini_extract
 from competitor_analysis.extraction.gemini import RateLimiter, _is_retryable, _retry_delay_from
 from competitor_analysis.reporting import data
 from competitor_analysis.reporting.validate import extract_numbers, _flatten_numbers, _normalize
+
+log = logging_setup.get_logger(__name__)
 
 MODEL = "gemini-flash-latest"
 CACHE_ROOT = paths.GEMINI_CACHE / "report_llm"
@@ -112,8 +115,8 @@ async def _call_gemini_html(prompt_name, user_message, system_prompt, limiter,
             if not _is_retryable(e) or attempt == max_attempts - 1:
                 raise
             delay = _retry_delay_from(e, attempt)
-            print(f"[report_llm] {prompt_name}: retryable error ({type(e).__name__}), "
-                  f"retrying in {delay:.1f}s (attempt {attempt + 1}/{max_attempts})...")
+            log.info("%s: retryable error (%s), retrying in %.1fs (attempt %d/%d)...",
+                      prompt_name, type(e).__name__, delay, attempt + 1, max_attempts)
             await asyncio.sleep(delay)
 
 
@@ -175,13 +178,13 @@ async def _generate_all(rows, system_prompt, limiter):
     ordered_pages = []
     for sn, page in zip(slide_nos, slide_pages):
         if isinstance(page, Exception):
-            print(f"[report_llm] Slide {sn}: failed after retries ({page}); omitting from report.")
+            log.error("Slide %s: failed after retries (%s); omitting from report.", sn, page)
             continue
         if page.strip():
             ordered_pages.append(page)
 
     if isinstance(highlights, Exception):
-        print(f"[report_llm] Key Highlights: failed after retries ({highlights}); omitting.")
+        log.error("Key Highlights: failed after retries (%s); omitting.", highlights)
         highlights = ""
 
     return front_back, ordered_pages, highlights
@@ -304,10 +307,10 @@ def generate_report(data_engine_path=None, out_path=None):
 
     suspicious = _verify_numbers(html_doc, rows)
     if suspicious:
-        print(f"[report_llm] {len(suspicious)} number(s) in the report could not be traced "
-              f"to the Data Engine - review before use: {suspicious}")
+        log.warning("%d number(s) in the report could not be traced to the Data Engine - "
+                    "review before use: %s", len(suspicious), suspicious)
     else:
-        print("[report_llm] Every number in the report traces back to the Data Engine.")
+        log.info("Every number in the report traces back to the Data Engine.")
 
-    print(f"[report_llm] Saved {out_path} ({len(pages)} slide pages)")
+    log.info("Saved %s (%d slide pages)", out_path, len(pages))
     return out_path, suspicious

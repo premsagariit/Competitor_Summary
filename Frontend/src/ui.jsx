@@ -269,8 +269,8 @@ export function ActivityLog({ entries }) {
     if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
   }, [entries.length]);
 
-  const levelColor = { info: "text-slate-400", success: "text-emerald-400", warn: "text-amber-400", error: "text-rose-400" };
-  const levelDot = { info: "bg-slate-500", success: "bg-emerald-500", warn: "bg-amber-500", error: "bg-rose-500" };
+  const levelColor = { info: "text-slate-400", warning: "text-amber-400", error: "text-rose-400", critical: "text-rose-400" };
+  const levelDot = { info: "bg-slate-500", warning: "bg-amber-500", error: "bg-rose-500", critical: "bg-rose-500" };
 
   return (
     <div ref={ref} className="font-mono text-[12.5px] leading-relaxed h-full overflow-y-auto pr-1 scrollbar-thin">

@@ -25,5 +25,5 @@ streamlit
 fastapi
 uvicorn[standard]
 
-# Durable document storage (Cloudflare R2, S3-compatible)
+# Durable document storage (S3-compatible: AWS S3, Cloudflare R2, MinIO)
 boto3

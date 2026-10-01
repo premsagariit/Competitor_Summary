@@ -21,6 +21,7 @@ import re
 from competitor_analysis.extraction import pdf_cache
 from competitor_analysis import config as cfg
 from competitor_analysis.extraction.pdf_cache import COMPANY_PDFS
+from competitor_analysis.rounding import round_half_up
 
 # Every time a column/period cannot be resolved from a form's own header text
 # and a documented fallback is used instead, the reason is appended here
@@ -593,8 +594,94 @@ def get_line_item(fp: FormPage, *label_substrings, cur_year_frag=None, prior_yea
     return cur_val, prior_val
 
 
+# Exact-match spellings (never substring - "Health" must not also match
+# "Total Health") accepted per line-of-business group, across the insurers
+# checked so far (NBHI: "Health"/"Personal Accident"/"Travel Insurance";
+# ABHI: "Health"/"Personal Accident"/"Travel"). Extend as new insurers'
+# filings turn up other spellings.
+_SEGMENT_ALIASES = {
+    "Health": {"health", "health insurance"},
+    "Personal Accident": {"personal accident", "pa"},
+    "Travel": {"travel", "travel insurance"},
+}
+
+
+def get_segment_line_item(fp: FormPage, segment, *label_substrings, cur_year_frag=None, prior_year_frag=None):
+    """Like get_line_item, but resolves the named line-of-business GROUP's
+    own column (segment="Health"/"Personal Accident"/"Travel", see
+    _SEGMENT_ALIASES) instead of the Grand Total column get_line_item always
+    walks to via _extend_to_total_column.
+
+    Group and period are two independent header axes on the same table
+    (classify_group_columns / classify_period_columns respectively) - this
+    intersects them: a column counts only if it is EXACTLY labeled with one
+    of the segment's accepted spellings AND carries a cumulative period
+    label for the target year. Both axes are searched across the table's
+    full row range regardless of which one sits above/below the other (see
+    _extend_to_total_column's docstring on this varying by insurer - e.g.
+    CARE prints the group-label row below its period-header row)."""
+    aliases = _SEGMENT_ALIASES[segment]
+    if cur_year_frag is None or prior_year_frag is None:
+        cur_year_frag, prior_year_frag = year_frags()
+    matches = fp.find_rows(*label_substrings)
+    if not matches:
+        return None, None
+    cur_val = prior_val = None
+    for row, ti, ridx in matches:
+        table = fp.tables[ti]
+        group_events = classify_group_columns(table)
+        segment_cols = {e["col"] for e in group_events
+                        if " ".join(str(e["label"]).split()).strip().lower() in aliases}
+        if not segment_cols:
+            continue
+        period_events = classify_period_columns(table, cur_year_frag, prior_year_frag)
+
+        def _resolve(period_kind):
+            # Nearest PRECEDING (row <= ridx) matching header, same rule
+            # _col_for uses - required because a stacked-blocks layout
+            # (current-year block, then prior-year block, in the same
+            # table - e.g. ABHI's NL-4) reuses the same column INDICES for
+            # both blocks, so without the row bound a later block's header
+            # would satisfy an earlier block's data row (or vice versa) and
+            # silently pick the wrong year's value out of the wrong block.
+            best_col, best_ridx = None, None
+            for e in period_events:
+                if e["col"] not in segment_cols or e["period"] != period_kind:
+                    continue
+                if e["row"] > ridx:
+                    continue
+                if best_ridx is None or e["row"] > best_ridx:
+                    best_col, best_ridx = e["col"], e["row"]
+            return best_col
+
+        cur_idx = _resolve("current_cumulative")
+        prior_idx = _resolve("prior_cumulative")
+        if cur_idx is not None and cur_idx < len(row) and (cur_val is None or cur_val == 0):
+            v = parse_num(row[cur_idx])
+            if v is not None and (cur_val is None or v != 0):
+                cur_val = v
+        if prior_idx is not None and prior_idx < len(row) and (prior_val is None or prior_val == 0):
+            v = parse_num(row[prior_idx])
+            if v is not None and (prior_val is None or v != 0):
+                prior_val = v
+    return cur_val, prior_val
+
+
+def get_segment_line_item_any(fp: FormPage, segment, label_variants, cur_year_frag=None, prior_year_frag=None):
+    """get_line_item_any's counterpart for get_segment_line_item - insurers
+    don't all use the same wording for the same line item on a segmented
+    form either (e.g. NBHI/ABHI's "Gross Direct Premium" vs ManipalCigna's
+    "Premium from direct business written")."""
+    for variant in label_variants:
+        cur, prior = get_segment_line_item(fp, segment, *variant, cur_year_frag=cur_year_frag,
+                                            prior_year_frag=prior_year_frag)
+        if cur is not None or prior is not None:
+            return cur, prior
+    return None, None
+
+
 def sum_rows_after(fp: FormPage, anchor_substrings, stop_pattern, table_idx=None,
-                    cur_year_frag=None, prior_year_frag=None):
+                    cur_year_frag=None, prior_year_frag=None, include_anchor=False):
     """Sum every sub-item row's (current, prior) cumulative values nested
     under a GROUP header row - a row that names the group (e.g. NL-2's "(f)
     Contribution to Policyholders' A/c") but carries no values of its own,
@@ -607,7 +694,11 @@ def sum_rows_after(fp: FormPage, anchor_substrings, stop_pattern, table_idx=None
     Sums every row after the anchor until a row whose label matches
     `stop_pattern` (the next top-level lettered item, or a TOTAL row) is
     reached. Returns (None, None) if the anchor isn't found or no sub-row
-    carried a parseable value for a period."""
+    carried a parseable value for a period.
+
+    `include_anchor` also counts the anchor row's own values - for a group
+    some filers print as one already-summed line instead of a valueless
+    header over sub-items (a valueless header adds nothing either way)."""
     if cur_year_frag is None or prior_year_frag is None:
         _cur, _prior = year_frags()
         cur_year_frag = cur_year_frag or _cur
@@ -620,9 +711,9 @@ def sum_rows_after(fp: FormPage, anchor_substrings, stop_pattern, table_idx=None
     events = fp._events(ti)
     cur_total = prior_total = 0.0
     found = False
-    for r in range(anchor_ridx + 1, len(table)):
+    for r in range(anchor_ridx if include_anchor else anchor_ridx + 1, len(table)):
         label = next((c for c in table[r] if c), None)
-        if label and stop_pattern.search(" ".join(str(label).split())):
+        if r != anchor_ridx and label and stop_pattern.search(" ".join(str(label).split())):
             break
         cur_idx, cur_hdr_ridx = _col_for(events, r, cur_year_frag)
         prior_idx, prior_hdr_ridx = _col_for(events, r, prior_year_frag)
@@ -640,6 +731,51 @@ def sum_rows_after(fp: FormPage, anchor_substrings, stop_pattern, table_idx=None
                 prior_total += v
                 found = True
     return (cur_total, prior_total) if found else (None, None)
+
+
+def sum_lines_after_from_text(text, anchor_substrings, stop_pattern, form=""):
+    """sum_rows_after's counterpart for a page with no ruled gridlines (read
+    via get_form_text): sums the cumulative (current, prior) values of every
+    line from the first line containing all `anchor_substrings` - itself
+    included, so a group printed as one summed line still counts - up to
+    the first later line matching `stop_pattern`. Columns resolve from the
+    form's own period header, exactly as get_line_item_from_text does.
+    Returns (None, None) if the anchor isn't found or no line in the group
+    carried a parseable value."""
+    if not text:
+        return None, None
+    cur_col, prior_col = _text_period_columns(text, form=form)
+    if cur_col is None or prior_col is None:
+        _log(f"{form or 'form'}: could not resolve cumulative columns from header "
+             f"text for group {anchor_substrings}; returning no value rather than "
+             f"guessing a column order.")
+        return None, None
+    lines = text.splitlines()
+    start = next((i for i, l in enumerate(lines)
+                  if all(s.lower() in l.lower() for s in anchor_substrings)), None)
+    if start is None:
+        return None, None
+    cur_total = prior_total = 0.0
+    found_cur = found_prior = False
+    for i in range(start, len(lines)):
+        if i != start and stop_pattern.search(lines[i]):
+            break
+        # Drop the anchor's own label text (it can carry a digit, e.g.
+        # "3OTHER INCOME") before the line is tokenized.
+        line = lines[i]
+        if i == start:
+            low = line.lower()
+            for s in anchor_substrings:
+                idx = low.find(s.lower())
+                line, low = line[idx + len(s):], low[idx + len(s):]
+        cur, prior = get_line_item_from_text(line, "", cur_col=cur_col, prior_col=prior_col, form=form)
+        if cur is not None:
+            cur_total += cur
+            found_cur = True
+        if prior is not None:
+            prior_total += prior
+            found_prior = True
+    return (cur_total if found_cur else None, prior_total if found_prior else None)
 
 
 def get_single_value(fp: FormPage, *label_substrings):
@@ -680,7 +816,14 @@ def _norm_label(s):
     return re.sub(r"[^a-z0-9]", "", str(s or "").lower())
 
 
-def _nl36_blocks(table):
+# _PERIOD_LABEL_RE plus "year": at Q4 some filers (ABHI, Galaxy) head
+# NL-36's cumulative blocks "Upto The Year Ended ...". Kept separate so the
+# shared text-fallback column resolver's behaviour doesn't change.
+_NL36_PERIOD_LABEL_RE = re.compile(
+    r"(up\s*to|upto|for)\s+the\s+(?:corresponding\s+)?(quarter|period|year)", re.I)
+
+
+def _nl36_blocks(table, sub="premium"):
     """Map NL-36's two header rows onto numeric column indices.
 
     NL-36 splits each period into two sub-columns ("No. of Policies" and
@@ -689,12 +832,13 @@ def _nl36_blocks(table):
     first. So the premium column is located by reading the sub-header text,
     never by assuming it is the second of the pair.
 
-    Returns (cur_premium_col, prior_premium_col) as absolute column indices.
+    Returns (cur_col, prior_col) as absolute column indices of the
+    cumulative block's `sub` sub-column: "premium" (default) or "policies".
     """
     period_row = period_cells = None
     for row in table[:6]:
         hits = [(i, " ".join(str(c).split())) for i, c in enumerate(row)
-                if c and _PERIOD_LABEL_RE.search(" ".join(str(c).split()))]
+                if c and _NL36_PERIOD_LABEL_RE.search(" ".join(str(c).split()))]
         if len(hits) >= 2:
             period_row, period_cells = row, hits
             break
@@ -710,22 +854,26 @@ def _nl36_blocks(table):
 
     blocks = []
     for idx, (col, text) in enumerate(period_cells):
-        kind = "cum" if re.search(r"up\s*to|upto", text, re.I) else "qtr"
+        # "For the Period/Year ended" is cumulative too (CIGNA FY24-25 Q4).
+        kind = "cum" if re.search(r"up\s*to|upto|\bperiod\b|\byear\b", text, re.I) else "qtr"
         end = period_cells[idx + 1][0] if idx + 1 < len(period_cells) else len(period_row)
         blocks.append((kind, col, end, text))
+
+    label_re = re.compile(r"polic" if sub == "policies" else r"premium", re.I)
 
     def premium_col(start, end):
         if sub_row:
             for c in range(start, min(end, len(sub_row))):
-                if sub_row[c] and "premium" in str(sub_row[c]).lower():
+                if sub_row[c] and label_re.search(str(sub_row[c])):
                     return c
         # No readable sub-header (text extraction occasionally drops the
-        # "Premium" label entirely) - fall back to the pair's second column,
-        # which is the layout every filing but Narayana's uses.
-        _log("NL-36: no readable 'Premium' sub-header in columns "
-             f"{start}-{end}; defaulting to the second column of the pair "
-             "because that is the majority layout.")
-        return start + 1
+        # label entirely) - fall back to the pair's second column for
+        # premium / first for policies, the layout every filing but
+        # Narayana's uses.
+        _log(f"NL-36: no readable '{sub}' sub-header in columns "
+             f"{start}-{end}; defaulting to the majority layout "
+             "(policies, then premium).")
+        return start + 1 if sub == "premium" else start
 
     cum = [(b, premium_col(b[1], b[2])) for b in blocks if b[0] == "cum"]
     if len(cum) < 2:
@@ -747,6 +895,28 @@ def _nl36_blocks(table):
         cur_col = cum[0][1] if cur_col is None else cur_col
         prior_col = cum[1][1] if prior_col is None else prior_col
     return cur_col, prior_col
+
+
+def extract_nl36_policies(pdf_path):
+    """(cur, prior) total number of policies, up to the quarter - NL-36's
+    own Grand Total (A+B) row (Total (A) if a filing prints no Grand Total),
+    read from the "No. of Policies" sub-column. This is every channel,
+    Direct Business/MISP/Micro included - summing the named channels
+    misses those. (None, None) if not found."""
+    fp, _ = get_form_page(pdf_path, r"FORM\s+NL-36")
+    if fp is None or not fp.tables:
+        return None, None
+    table = max(fp.tables, key=len)
+    cur_col, prior_col = _nl36_blocks(table, sub="policies")
+    if cur_col is None:
+        return None, None
+    found = {}
+    for row in table:
+        label = _norm_label(next((str(c) for c in row[:3] if c and re.search(r"[A-Za-z]", str(c))), ""))
+        for key in ("grandtotal", "totala"):
+            if label.startswith(key) and key not in found:
+                found[key] = tuple(parse_num(row[c]) if c < len(row) else None for c in (cur_col, prior_col))
+    return found.get("grandtotal") or found.get("totala") or (None, None)
 
 
 def extract_nl36(pdf_path):
@@ -812,8 +982,15 @@ def extract_nl36(pdf_path):
         if start is not None:
             tot = [0.0, 0.0]
             for row in table[start + 1:]:
+                # A sub-row is dash-prefixed ("-Online") or, on filings that
+                # don't dash them (ABHI: "Officers/Employees", "Online ..."),
+                # carries no serial number of its own. The next numbered row
+                # (e.g. "7 Common Service Centres") or a Total row ends it.
                 raw = next((c for c in row[:2] if c), "")
-                if not str(raw).strip().startswith("-"):
+                serial = str(row[0] or "").strip().rstrip(".")
+                label = _norm_label(first_label(row))
+                if not str(raw).strip().startswith("-") and (serial.isdigit() or not label
+                                                             or label.startswith("total")):
                     break
                 v = row_vals(row)
                 for k in (0, 1):
@@ -830,6 +1007,6 @@ def extract_nl36(pdf_path):
         if total is None or any(v is None for v in named):
             others.append(None)
         else:
-            others.append(round(total - sum((v[k] or 0) for v in named), 2))
+            others.append(round_half_up(total - sum((v[k] or 0) for v in named), 2))
     out["others"] = tuple(others)
     return out

@@ -7,6 +7,8 @@ the underlying data is absent, per the report's "only show what we have"
 rule.
 """
 import math
+import textwrap
+from types import SimpleNamespace
 
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
@@ -15,6 +17,7 @@ from matplotlib.ticker import PercentFormatter
 
 from competitor_analysis.reporting import theme
 from competitor_analysis import config as cfg
+from competitor_analysis.rounding import fmt_fixed, round_half_up
 
 
 def _clean(ax):
@@ -41,8 +44,28 @@ def _num_fmt(v):
     value (e.g. 'Rs. Lakhs per agent' figures around 0.3-1.3) down to 0 or 1,
     destroying all the information a chart like that exists to show."""
     if abs(v) < 10:
-        return f"{v:,.2f}"
-    return f"{v:,.0f}"
+        return fmt_fixed(v, 2, grouping=True)
+    return fmt_fixed(v, 0, grouping=True)
+
+
+GROWTH_UP_COLOR = "#2E7D32"
+GROWTH_DOWN_COLOR = "#C00000"
+
+
+def _growth(cur, prior):
+    """YoY growth fraction, or None when there's no meaningful base (a
+    missing or non-positive prior value)."""
+    if cur is None or prior is None or prior <= 0:
+        return None
+    return cur / prior - 1
+
+
+def _growth_label(g):
+    return f"{'+' if g >= 0 else ''}{fmt_fixed(g * 100, 0)}%"
+
+
+def _growth_color(g):
+    return GROWTH_UP_COLOR if g >= 0 else GROWTH_DOWN_COLOR
 
 
 def _outlier_break(values, ratio_threshold=5):
@@ -136,7 +159,7 @@ def _indian_grouping(n):
     not Western 3-digit grouping (which agrees with it below 1,00,000 but
     diverges above)."""
     sign = "-" if n < 0 else ""
-    s = f"{abs(round(n)):.0f}"
+    s = str(abs(round_half_up(n)))
     if len(s) <= 3:
         return sign + s
     last3, rest = s[-3:], s[:-3]
@@ -170,6 +193,11 @@ def doughnut_pair(fig, subplot_spec, prior_period_label, current_period_label, l
     if not pairs_prior and not pairs_cur:
         return False
     inner = gridspec.GridSpecFromSubplotSpec(1, 2, subplot_spec=subplot_spec, wspace=0.25)
+    # The dashed box's inner edges (same geometry as drawn at the end of this
+    # function) - outside callout labels are kept within it.
+    panel_bbox = subplot_spec.get_position(fig)
+    panel = SimpleNamespace(x0=panel_bbox.x0 - 0.014, x1=panel_bbox.x1 + 0.014,
+                            y0=panel_bbox.y0 - 0.018, y1=panel_bbox.y1)
     for i, (period_label, pairs) in enumerate([(prior_period_label, pairs_prior), (current_period_label, pairs_cur)]):
         ax = fig.add_subplot(inner[i])
         if not pairs:
@@ -191,11 +219,15 @@ def doughnut_pair(fig, subplot_spec, prior_period_label, current_period_label, l
             v = pct / 100 * total
             return value_fmt(v) if pct >= 3 else ""
 
+        # The ring is drawn at radius R inside fixed axis limits (XL, YL), so
+        # the outside name/% callouts always have room within the axes - and
+        # so within the panel's dashed box - instead of growing past it.
+        R = 1.0
         wedges, _, autotexts = ax.pie(
-            vals, colors=cols, autopct=_autopct, pctdistance=0.73,
-            wedgeprops=dict(width=0.55, edgecolor="white"), startangle=90)
+            vals, colors=cols, autopct=_autopct, pctdistance=0.73, radius=R,
+            wedgeprops=dict(width=0.55 * R, edgecolor="white"), startangle=90)
         for t in autotexts:
-            t.set_fontsize(7)
+            t.set_fontsize(8)
             t.set_fontweight("bold")
             t.set_color("white")
 
@@ -215,12 +247,13 @@ def doughnut_pair(fig, subplot_spec, prior_period_label, current_period_label, l
         renderer = fig.canvas.get_renderer()
         n = len(wedges)
         spans = [w.theta2 - w.theta1 for w in wedges]
+        ring = 0.73 * R
         for wi, (w, t) in enumerate(zip(wedges, autotexts)):
             if not t.get_text():
                 continue
             text_w = t.get_window_extent(renderer=renderer).width
             own_span = math.radians(spans[wi])
-            chord = 2 * 0.73 * math.sin(own_span / 2)
+            chord = 2 * ring * math.sin(own_span / 2)
             p0, p1 = ax.transData.transform((0, 0)), ax.transData.transform((chord, 0))
             chord_px = abs(p1[0] - p0[0])
             if text_w <= chord_px * 0.92:
@@ -229,27 +262,79 @@ def doughnut_pair(fig, subplot_spec, prior_period_label, current_period_label, l
             toward_next = next_span >= prev_span
             neighbor_span = math.radians(next_span if toward_next else prev_span)
             scale = (chord_px / chord) if chord else 1
-            needed_rad = ((text_w - chord_px) / scale) / 0.73 if scale else 0
+            needed_rad = ((text_w - chord_px) / scale) / ring if scale else 0
             if needed_rad > neighbor_span * 0.45:
                 t.set_text("")
                 continue
             bisector = math.radians((w.theta1 + w.theta2) / 2)
             ang = bisector + (needed_rad if toward_next else -needed_rad)
-            t.set_position((0.73 * math.cos(ang), 0.73 * math.sin(ang)))
+            t.set_position((ring * math.cos(ang), ring * math.sin(ang)))
 
-        # Outside callout labels (name + share). Deliberately NOT ax.pie's
-        # own `labels=` kwarg: that always centers text on its anchor point,
-        # which for a wide wedge on the circle's left half runs the label
-        # straight back into the ring (and into the inside value text) -
-        # anchoring by the text's edge, on whichever side of the circle the
-        # wedge actually falls, keeps it growing outward instead.
+        # Outside callout labels (name + share), anchored by the edge facing
+        # away from the ring so they grow outward. Then, per side: labels of
+        # adjacent small slices are spread apart vertically so they never
+        # overlap (a thin leader line ties each back to its slice), and any
+        # label that would cross the axes edge is pulled back inside.
+        px_per_unit = (ax.transData.transform((1, 1)) - ax.transData.transform((0, 0)))
+        callouts = []
         for w, name, v in zip(wedges, labs, vals):
             ang = math.radians((w.theta1 + w.theta2) / 2)
             x, y = math.cos(ang), math.sin(ang)
             pct = (v / total * 100) if total else 0
-            ax.annotate(f"{name}\n{pct:.1f}%", xy=(x, y), xytext=(1.22 * x, 1.15 * y),
-                        ha="left" if x >= 0 else "right", va="center", fontsize=7,
-                        color=theme.GREY_TEXT, annotation_clip=False)
+            wrapped = "\n".join(textwrap.wrap(str(name), 16)) or str(name)
+            t = ax.text(0, 0, f"{wrapped}\n{fmt_fixed(pct, 1)}%", fontsize=7.5, color=theme.GREY_TEXT,
+                        ha="left" if x >= 0 else "right", va="center")
+            ext = t.get_window_extent(renderer=renderer)
+            callouts.append({"text": t, "anchor": (R * x, R * y), "side": 1 if x >= 0 else -1,
+                             "x": 1.22 * R * x, "y": 1.15 * R * y,
+                             "w": ext.width / px_per_unit[0], "h": ext.height / px_per_unit[1]})
+        # Where a label may go, in this axes' data units: inside the panel's
+        # dashed box, and on this doughnut's own half of the gap between the
+        # two doughnuts (so neither pair's labels can run into the other's).
+        cell_l, cell_r = inner[0].get_position(fig), inner[1].get_position(fig)
+        mid = (cell_l.x1 + cell_r.x0) / 2
+        margin = 0.006
+        fx0 = (panel.x0 + margin) if i == 0 else (mid + margin)
+        fx1 = (mid - margin) if i == 0 else (panel.x1 - margin)
+        to_data = lambda fx, fy: ax.transData.inverted().transform(fig.transFigure.transform((fx, fy)))
+        lo_x, lo_y = to_data(fx0, panel.y0 + margin)
+        hi_x, hi_y = to_data(fx1, panel.y1 - margin)
+
+        gap = 0.03
+        for side in (1, -1):
+            group = sorted((c for c in callouts if c["side"] == side), key=lambda c: -c["y"])
+            for prev, cur in zip(group, group[1:]):
+                limit = prev["y"] - (prev["h"] + cur["h"]) / 2 - gap
+                if cur["y"] > limit:
+                    cur["y"] = limit
+            if group:
+                low = group[-1]["y"] - group[-1]["h"] / 2
+                if low < lo_y:
+                    for c in group:
+                        c["y"] += lo_y - low
+                high = group[0]["y"] + group[0]["h"] / 2
+                if high > hi_y:
+                    for c in group:
+                        c["y"] -= high - hi_y
+            for c in group:
+                # Start the label clear of the ring at its own height (the
+                # vertical spreading above can move it level with the ring)...
+                top, bottom = c["y"] + c["h"] / 2, c["y"] - c["h"] / 2
+                nearest = 0.0 if bottom <= 0 <= top else min(abs(top), abs(bottom))
+                if nearest < R:
+                    clear = math.sqrt(R * R - nearest * nearest) + 0.06
+                    c["x"] = side * max(abs(c["x"]), clear)
+                # ...then pull back anything that would still cross its
+                # allowed area - staying inside the box wins over clearance.
+                if side > 0:
+                    c["x"] = min(c["x"], hi_x - c["w"])
+                else:
+                    c["x"] = max(c["x"], lo_x + c["w"])
+        for c in callouts:
+            c["text"].set_position((c["x"], c["y"]))
+            ax.annotate("", xy=c["anchor"], xytext=(c["x"], c["y"]),
+                        arrowprops=dict(arrowstyle="-", color=theme.GRID_COLOR, linewidth=0.6,
+                                        shrinkA=1, shrinkB=1))
 
         lines = ([(group_label, 6.5, theme.DARK_TEXT)] if group_label else []) + [
             (period_label, 6.5, theme.DARK_TEXT),
@@ -282,8 +367,27 @@ def doughnut_pair(fig, subplot_spec, prior_period_label, current_period_label, l
     return True
 
 
+def _annotate_pair_growth(ax, x, pri, cur, raw_pairs, only_if=None):
+    """Writes each category's YoY growth (current vs prior) centered above
+    its bar pair, clear of the pair's own value labels. `only_if(top)`, if
+    given, restricts labelling to pairs whose taller bar belongs on `ax`
+    (the broken-axis case, so a pair isn't labelled in both panels)."""
+    for xi, p, c, (_, raw_p, raw_c) in zip(x, pri, cur, raw_pairs):
+        g = _growth(raw_c, raw_p)
+        if g is None:
+            continue
+        top = max(p, c, 0)
+        if only_if is not None and not only_if(top):
+            continue
+        ax.annotate(_growth_label(g), (xi, top), textcoords="offset points", xytext=(0, 11),
+                    ha="center", va="bottom", fontsize=7.5, fontweight="bold", color=_growth_color(g))
+
+
 def grouped_bar(fig, subplot_spec, categories, prior_values, current_values, prior_label=None,
-                 current_label=None, is_percent=False, higher_is_better=True):
+                 current_label=None, is_percent=False, higher_is_better=True, show_growth=False):
+    """`show_growth`, if set, labels each category with its current-vs-prior
+    YoY growth % above its pair of bars (money-type metrics - for a ratio
+    metric a change in percentage points is the meaningful figure instead)."""
     prior_label = prior_label or cfg.prior_period_label()
     current_label = current_label or cfg.cur_period_label()
     pairs = [(c, p, cu) for c, p, cu in zip(categories, prior_values, current_values)
@@ -295,11 +399,14 @@ def grouped_bar(fig, subplot_spec, categories, prior_values, current_values, pri
     cur = [p[2] if p[2] is not None else 0 for p in pairs]
     x = list(range(len(cats)))
     w = 0.36
-    fmt = (lambda v: f"{v * 100:.1f}%") if is_percent else _num_fmt
+    # Bar centres sit `off` either side of the category - a little more than
+    # half a bar apart - so the two value labels have room side by side.
+    off = 0.21
+    fmt = (lambda v: f"{fmt_fixed(v * 100, 1)}%") if is_percent else _num_fmt
 
     def _draw(ax):
-        b1 = ax.bar([i - w / 2 for i in x], pri, width=w, label=prior_label, color=theme.PRIOR_COLOR)
-        b2 = ax.bar([i + w / 2 for i in x], cur, width=w, label=current_label, color=theme.CURRENT_COLOR)
+        b1 = ax.bar([i - off for i in x], pri, width=w, label=prior_label, color=theme.PRIOR_COLOR)
+        b2 = ax.bar([i + off for i in x], cur, width=w, label=current_label, color=theme.CURRENT_COLOR)
         ax.set_xticks(x)
         return b1, b2
 
@@ -308,11 +415,13 @@ def grouped_bar(fig, subplot_spec, categories, prior_values, current_values, pri
         ax = fig.add_subplot(subplot_spec)
         b1, b2 = _draw(ax)
         for bars, vals in ((b1, pri), (b2, cur)):
-            ax.bar_label(bars, labels=[fmt(v) for v in vals], fontsize=6.5, padding=1)
+            ax.bar_label(bars, labels=[fmt(v) for v in vals], fontsize=7.5, padding=1)
+        if show_growth:
+            _annotate_pair_growth(ax, x, pri, cur, pairs)
         # Extra headroom (vs. the 0.14 default) so the legend - anchored at
         # the very top of the axes - has clear air above the tallest bar's
-        # value label instead of sitting on top of it.
-        _add_headroom(ax, pri + cur, frac=0.30)
+        # value label (and growth label, when shown) instead of sitting on it.
+        _add_headroom(ax, pri + cur, frac=0.40 if show_growth else 0.30)
         ax.set_xticklabels(cats, fontsize=8)
         _style_bar_axes(ax)
         ax.legend(fontsize=7, frameon=False, loc="upper right", bbox_to_anchor=(1.0, 1.02))
@@ -331,17 +440,20 @@ def grouped_bar(fig, subplot_spec, categories, prior_values, current_values, pri
     # axis's ylim, so clipping a bar at the OTHER axis's boundary happens
     # mid-bar, not at a top edge, avoiding the antialiasing sliver a
     # boundary-hugging clip could otherwise leave.
-    b1t = ax_top.bar([i - w / 2 for i in x], pri, width=w, label=prior_label, color=theme.PRIOR_COLOR)
-    b2t = ax_top.bar([i + w / 2 for i in x], cur, width=w, label=current_label, color=theme.CURRENT_COLOR)
+    b1t = ax_top.bar([i - off for i in x], pri, width=w, label=prior_label, color=theme.PRIOR_COLOR)
+    b2t = ax_top.bar([i + off for i in x], cur, width=w, label=current_label, color=theme.CURRENT_COLOR)
     ax_top.set_xticks(x)
-    b1b = ax_bot.bar([i - w / 2 for i in x], pri, width=w, label=prior_label, color=theme.PRIOR_COLOR)
-    b2b = ax_bot.bar([i + w / 2 for i in x], cur, width=w, label=current_label, color=theme.CURRENT_COLOR)
+    b1b = ax_bot.bar([i - off for i in x], pri, width=w, label=prior_label, color=theme.PRIOR_COLOR)
+    b2b = ax_bot.bar([i + off for i in x], cur, width=w, label=current_label, color=theme.CURRENT_COLOR)
     # Label only the axis a bar's true value actually falls in, so a tall
     # bar isn't labeled twice (once in each panel).
-    ax_top.bar_label(b1t, labels=[fmt(v) if v > bottom_max else "" for v in pri], fontsize=6.5, padding=1)
-    ax_top.bar_label(b2t, labels=[fmt(v) if v > bottom_max else "" for v in cur], fontsize=6.5, padding=1)
-    ax_bot.bar_label(b1b, labels=[fmt(v) if v <= bottom_max else "" for v in pri], fontsize=6.5, padding=1)
-    ax_bot.bar_label(b2b, labels=[fmt(v) if v <= bottom_max else "" for v in cur], fontsize=6.5, padding=1)
+    ax_top.bar_label(b1t, labels=[fmt(v) if v > bottom_max else "" for v in pri], fontsize=7.5, padding=1)
+    ax_top.bar_label(b2t, labels=[fmt(v) if v > bottom_max else "" for v in cur], fontsize=7.5, padding=1)
+    ax_bot.bar_label(b1b, labels=[fmt(v) if v <= bottom_max else "" for v in pri], fontsize=7.5, padding=1)
+    ax_bot.bar_label(b2b, labels=[fmt(v) if v <= bottom_max else "" for v in cur], fontsize=7.5, padding=1)
+    if show_growth:
+        _annotate_pair_growth(ax_top, x, pri, cur, pairs, only_if=lambda top: top > bottom_max)
+        _annotate_pair_growth(ax_bot, x, pri, cur, pairs, only_if=lambda top: top <= bottom_max)
     lo = min(0, min(pri + cur))
     _finish_broken_axes(ax_top, ax_bot, bottom_max, top_max, lo=lo)
     ax_bot.set_xticks(x)
@@ -361,13 +473,13 @@ def single_bar(fig, subplot_spec, categories, values, is_percent=False, color=No
         return False
     cats = [p[0] for p in pairs]
     vals = [p[1] for p in pairs]
-    fmt = (lambda v: f"{v * 100:.1f}%") if is_percent else _num_fmt
+    fmt = (lambda v: f"{fmt_fixed(v * 100, 1)}%") if is_percent else _num_fmt
 
     brk = _outlier_break(vals)
     if brk is None:
         ax = fig.add_subplot(subplot_spec)
         bars = ax.bar(cats, vals, color=color or theme.BLUE)
-        ax.bar_label(bars, labels=[fmt(v) for v in vals], fontsize=7, padding=1)
+        ax.bar_label(bars, labels=[fmt(v) for v in vals], fontsize=8, padding=1)
         _add_headroom(ax, vals)
         ax.tick_params(axis="x", labelsize=8)
         _style_bar_axes(ax)
@@ -382,8 +494,8 @@ def single_bar(fig, subplot_spec, categories, values, is_percent=False, color=No
     # longer version of this comment for why (same fix, same reason).
     bars_top = ax_top.bar(cats, vals, color=color or theme.BLUE)
     bars_bot = ax_bot.bar(cats, vals, color=color or theme.BLUE)
-    ax_top.bar_label(bars_top, labels=[fmt(v) if v > bottom_max else "" for v in vals], fontsize=7, padding=1)
-    ax_bot.bar_label(bars_bot, labels=[fmt(v) if v <= bottom_max else "" for v in vals], fontsize=7, padding=1)
+    ax_top.bar_label(bars_top, labels=[fmt(v) if v > bottom_max else "" for v in vals], fontsize=8, padding=1)
+    ax_bot.bar_label(bars_bot, labels=[fmt(v) if v <= bottom_max else "" for v in vals], fontsize=8, padding=1)
     lo = min(0, min(vals))
     _finish_broken_axes(ax_top, ax_bot, bottom_max, top_max, lo=lo)
     ax_bot.tick_params(axis="x", labelsize=8)
@@ -391,8 +503,29 @@ def single_bar(fig, subplot_spec, categories, values, is_percent=False, color=No
 
 
 def stacked_bar(ax, categories, series_dict, colors, pct100=True, value_labels=True, show_totals=False,
-                 show_yaxis=False):
+                 show_yaxis=False, raw_value_labels=False, prior_series=None, display_totals=None,
+                 segment_pcts=None):
     """series_dict: {series_name: [value_per_category, ...]}.
+
+    `segment_pcts`, if given (same shape as series_dict), is what each
+    segment is labelled with, as a fraction shown as a whole percent
+    ("12%"), instead of its share of the bar - e.g. slide 13, whose segments
+    are sized by the channel commission rates themselves (normalized to a
+    full bar) and labelled with the rates as-is. A None entry leaves that
+    segment unlabelled.
+
+    `display_totals`, if given (aligned to `categories`), is what
+    `show_totals` prints above each bar instead of the bar's own summed
+    total - for a bar whose series are already mix fractions (they sum to 1),
+    whose real absolute total has to come from elsewhere. A None entry gets
+    no total label.
+
+    `prior_series`, if given (same shape as series_dict, aligned to the same
+    `categories`, for the last-year counterpart period), adds each bar's YoY
+    growth % - its absolute total vs. the prior period's total for the same
+    category - on the line beneath the total when `show_totals` is on, or
+    alone above the bar otherwise. A category with no positive prior total
+    gets no growth label.
 
     `show_totals`, if set, annotates each bar's own absolute total (the
     per-category sum across all series, before any pct100 normalization -
@@ -401,6 +534,14 @@ def stacked_bar(ax, categories, series_dict, colors, pct100=True, value_labels=T
     a reader sees both the mix (%, inside each segment) and the underlying
     scale (the absolute total, above the bar) at once.
 
+    `raw_value_labels`, with pct100=True, keeps the normalized-height bars
+    (every category the same total height, so a category whose own total is
+    tiny next to another's isn't squashed to invisible) but labels each
+    segment with its real absolute value instead of a %-of-bar share - for a
+    metric where the categories' totals differ by orders of magnitude (e.g.
+    Individual Agents vs. Web Aggregators) and the reader needs the actual
+    counts, not just each company's proportion within that one category.
+
     `show_yaxis=False` drops the y tick labels/ticks and the left spine -
     for a pct100 chart with `value_labels` on, the % already printed inside
     each segment makes the axis redundant."""
@@ -408,8 +549,12 @@ def stacked_bar(ax, categories, series_dict, colors, pct100=True, value_labels=T
     # A category where every series is None/0 (e.g. no SAHI company writes
     # any Govt.-scheme business) has nothing to show - drop it rather than
     # rendering an empty bar with a fabricated total.
+    # Likewise a category whose shown total (`display_totals`) is exactly 0:
+    # its mix fractions describe nothing - e.g. Narayana's FY25 geography,
+    # stored as 100% Karnataka against a GDPI of 0 - so it isn't drawn.
     present = [i for i in range(n)
-               if any((v[i] is not None and v[i] != 0) for v in series_dict.values())]
+               if any((v[i] is not None and v[i] != 0) for v in series_dict.values())
+               and not (display_totals is not None and display_totals[i] == 0)]
     if not present:
         return False
     cats = [categories[i] for i in present]
@@ -433,25 +578,48 @@ def stacked_bar(ax, categories, series_dict, colors, pct100=True, value_labels=T
             # label unconditionally; only the raw-value branch needs the
             # division to turn `v` into a share at all.
             labels = []
-            for v, tot in zip(vals, totals):
+            for j, (v, tot, rv) in enumerate(zip(vals, totals, raw[name])):
                 share = v if pct100 else (v / tot if tot else 0)
                 if not v or share < 0.04:
                     labels.append("")
+                elif segment_pcts is not None:
+                    pv = (segment_pcts.get(name) or [None] * n)[present[j]]
+                    labels.append(f"{fmt_fixed(pv * 100, 0)}%" if pv is not None else "")
+                elif raw_value_labels:
+                    labels.append(_num_fmt(rv))
                 else:
-                    labels.append(f"{v * 100:.0f}%" if pct100 else _num_fmt(v))
-            ax.bar_label(bars, labels=labels, label_type="center", fontsize=6, color="white")
+                    labels.append(f"{fmt_fixed(v * 100, 0)}%" if pct100 else _num_fmt(v))
+            ax.bar_label(bars, labels=labels, label_type="center", fontsize=7, color="white")
         bottoms = [b + v for b, v in zip(bottoms, vals)]
-    if show_totals:
+    growths = [None] * len(cats)
+    if prior_series:
+        for j, i in enumerate(present):
+            pvals = [vals[i] for vals in prior_series.values() if vals[i] is not None]
+            growths[j] = _growth(sum(raw[name][j] for name in raw), sum(pvals) if pvals else None)
+    show_growth = any(g is not None for g in growths)
+    if display_totals is not None:
+        totals = [display_totals[i] for i in present]
+    if show_totals or show_growth:
         headroom = 0.03 if pct100 else max(bottoms) * 0.03
-        for x, (top, tot) in enumerate(zip(bottoms, totals)):
-            ax.text(x, top + headroom, _indian_grouping(tot), ha="center", va="bottom", fontsize=7.5,
-                    fontweight="bold", color=theme.DARK_TEXT)
+        for x, (top, tot, g) in enumerate(zip(bottoms, totals, growths)):
+            if show_totals and tot is not None:
+                ax.text(x, top + headroom, _indian_grouping(tot), ha="center", va="bottom", fontsize=8.5,
+                        fontweight="bold", color=theme.DARK_TEXT)
+            if g is not None:
+                # Stacked just above the total (offset in points, so it
+                # clears the total's own text height at any axis scale).
+                ax.annotate(_growth_label(g), (x, top + headroom), textcoords="offset points",
+                            xytext=(0, 11 if show_totals else 0), ha="center", va="bottom", fontsize=7.5,
+                            fontweight="bold", color=_growth_color(g))
     ax.tick_params(axis="x", labelsize=7, rotation=0)
+    # Extra room above the bars for the growth line, on top of what the
+    # total alone needs.
+    growth_room = (0.12 if show_totals else 0.10) if show_growth else 0.0
     if pct100:
-        ax.set_ylim(0, 1.16 if show_totals else 1.05)
+        ax.set_ylim(0, (1.16 if show_totals else 1.05) + growth_room)
         ax.yaxis.set_major_formatter(PercentFormatter(1.0))
-    elif show_totals:
-        ax.set_ylim(0, max(bottoms) * 1.12)
+    elif show_totals or show_growth:
+        ax.set_ylim(0, max(bottoms) * (1.12 + growth_room))
     if show_yaxis:
         ax.tick_params(axis="y", labelsize=7)
     else:
@@ -462,19 +630,23 @@ def stacked_bar(ax, categories, series_dict, colors, pct100=True, value_labels=T
     return True
 
 
-def change_bar(ax, changes, unit="pp"):
+def change_bar(ax, changes, unit="%"):
     """Horizontal diverging bar - replaces the reference deck's dot/bubble
     'Market Share Change' mini-chart with a simpler, equally-informative
-    static chart. `changes`: {company_key: signed_change_value}."""
+    static chart. `changes`: {company_key: signed_change_value}.
+
+    Each bar keeps its company's own colour (matching the doughnut above it
+    on the same page) whatever the sign - direction is already carried by
+    the bar's side of the zero line and the +/- label."""
     pairs = [(k, v) for k, v in changes.items() if v is not None]
     if not pairs:
         return False
     labels = [theme.COMPANY_DISPLAY_NAME.get(k, k) for k, _ in pairs]
     vals = [v for _, v in pairs]
-    colors = [theme.COMPANY_COLORS.get(k, theme.ORANGE) if v >= 0 else "#C00000" for (k, _), v in zip(pairs, vals)]
+    colors = [theme.COMPANY_COLORS.get(k, theme.ORANGE) for k, _ in pairs]
     y = range(len(labels))
     bars = ax.barh(list(y), vals, color=colors)
-    ax.bar_label(bars, labels=[f"{'+' if v >= 0 else ''}{v:.1f}{unit}" for v in vals], fontsize=7, padding=3)
+    ax.bar_label(bars, labels=[f"{'+' if v >= 0 else ''}{fmt_fixed(v, 1)}{unit}" for v in vals], fontsize=8, padding=3)
     lo, hi = min(0, min(vals)), max(0, max(vals))
     span = (hi - lo) or (abs(hi) or 1)
     ax.set_xlim(lo - span * 0.18 if lo < 0 else lo, hi + span * 0.18 if hi > 0 else hi)
@@ -486,11 +658,96 @@ def change_bar(ax, changes, unit="pp"):
     return True
 
 
-def income_table(ax, row_labels, company_keys, values_dict, title):
+def trend_lines(fig, subplot_spec, years, company_keys, company_values, title=None, unit_label="INR Crore",
+                 is_percent=False, value_fmt=None, gap=0.14, pad=0.12, stretch=0.4, colors=None):
+    """One horizontal LANE per company (stacked top-to-bottom in
+    `company_keys` order), rather than every company sharing one y-axis. A
+    shared axis flattens whichever companies are far smaller than the
+    period's leader - e.g. a fast young insurer's 3x growth is invisible
+    next to STAR's absolute scale - so within its own lane each series is
+    independently min-max normalized ((v - min) / (max - min), padded by
+    `pad` on both ends for label clearance), making every company's OWN
+    shape equally readable regardless of its neighbors' scale. The plotted
+    position is this normalized value (compressed toward the lane's
+    vertical center by `stretch` - see below); every point is still
+    labeled with its REAL value via `fmt`. `gap` (in lane-height units)
+    separates lanes so no lane's line/labels can reach into its neighbor's.
+    Companies are identified via a shared legend below the axes (report-wide
+    convention), not per-lane labels.
+
+    Plain min-max normalization always stretches a lane's min to its very
+    bottom and max to its very top, regardless of how large that range
+    actually is in real terms - a metric that only moves ~20-30%
+    peak-to-trough over 9 years (e.g. Agent Productivity) ends up looking
+    just as dramatic a zigzag as one that triples. `stretch` (0-1) pulls the
+    normalized value in toward the lane's center by that factor before
+    plotting, damping the visual amplitude uniformly; the REAL values in the
+    labels are unaffected - only the line's shape is calmed down.
+
+    `company_values`: {company_key: [value_or_None, ...]} aligned to `years`.
+    `value_fmt`, if given, overrides the default label formatter (Indian
+    lakh/crore grouping, or a whole-number percent when `is_percent`) - e.g.
+    a metric whose values are small decimals (Rs. Lakhs per agent, ~1.3)
+    needs 2 decimal places, which lakh/crore grouping's round-to-int would
+    otherwise flatten to "1" for every year.
+    `colors`, if given, overrides theme.COMPANY_COLORS per key - for a
+    non-company series (e.g. SAHI/Industry aggregates), which would
+    otherwise all fall back to the same ORANGE default and be indistinguishable.
+    Returns False (draws nothing) if every company's series is empty."""
+    fmt = value_fmt or ((lambda v: f"{fmt_fixed(v * 100, 0)}%") if is_percent else _indian_grouping)
+    pairs = [(k, company_values.get(k)) for k in company_keys
+             if company_values.get(k) and any(v is not None for v in company_values[k])]
+    if not pairs:
+        return False
+    panel_box(fig, subplot_spec, title=title, unit_label=unit_label)
+    ax = fig.add_subplot(subplot_spec)
+    x = list(range(len(years)))
+    n = len(pairs)
+    lane_h = 1.0
+    step = lane_h + gap
+    for i, (k, vals) in enumerate(pairs):
+        pts = [(xi, v) for xi, v in zip(x, vals) if v is not None]
+        if not pts:
+            continue
+        color = (colors or {}).get(k) or theme.COMPANY_COLORS.get(k, theme.ORANGE)
+        vs = [v for _, v in pts]
+        lo, hi = min(vs), max(vs)
+        span = (hi - lo) or 1.0
+        y0 = (n - 1 - i) * step  # index 0 -> topmost lane
+
+        def norm(v, lo=lo, span=span, y0=y0):
+            frac = 0.5 if hi == lo else (v - lo) / span
+            frac = 0.5 + (frac - 0.5) * stretch
+            return y0 + pad + frac * (lane_h - 2 * pad)
+
+        label = theme.COMPANY_DISPLAY_NAME.get(k, k)
+        ax.plot([xi for xi, _ in pts], [norm(v) for _, v in pts], marker="o", markersize=3.5,
+                linewidth=1.6, color=color, label=label)
+        for xi, v in pts:
+            ax.annotate(fmt(v), (xi, norm(v)), textcoords="offset points", xytext=(0, 6),
+                        ha="center", fontsize=7.5, color=theme.DARK_TEXT)
+    ax.set_xticks(x)
+    ax.set_xticklabels(years, fontsize=8)
+    ax.margins(x=0.05)
+    ax.set_ylim(-gap * 0.3, n * step - gap * 0.7)
+    ax.set_yticks([])
+    ax.spines[["top", "right", "left"]].set_visible(False)
+    ax.legend(fontsize=7, frameon=False, loc="upper center", bbox_to_anchor=(0.5, -0.1), ncol=min(len(pairs), 5))
+    return True
+
+
+def income_table(ax, row_labels, company_keys, values_dict, title, percent_rows=None):
     """values_dict: {row_label: {company_key: value}}. Row labels are the
     table's own first column (not matplotlib's separate `rowLabels`, which
     is positioned outside the table's axes and gets clipped by the page
-    edge for a table this close to the left margin)."""
+    edge for a table this close to the left margin).
+
+    `percent_rows`, if given, is the set of row_labels (e.g. "Combined
+    Ratio") whose values are fractions to format as a whole-number percent
+    ("103.8%") instead of plain comma-grouped money ("1,822") - both shapes
+    can appear in the same table (e.g. a segment P&L with money rows above
+    ratio rows), so this is a per-row choice, not a whole-table one."""
+    percent_rows = percent_rows or set()
     present_cols = [k for k in company_keys if any(values_dict.get(r, {}).get(k) is not None for r in row_labels)]
     if not present_cols:
         return False
@@ -501,21 +758,27 @@ def income_table(ax, row_labels, company_keys, values_dict, title):
         row = [r]
         for k in present_cols:
             v = values_dict.get(r, {}).get(k)
-            row.append(f"{v:,.0f}" if isinstance(v, (int, float)) else "-")
+            if not isinstance(v, (int, float)):
+                row.append("-")
+            elif r in percent_rows:
+                row.append(f"{fmt_fixed(v * 100, 1)}%")
+            else:
+                row.append(fmt_fixed(v, 0, grouping=True))
         cell_text.append(row)
     n_cols = len(col_labels)
     col_widths = [0.28] + [0.72 / (n_cols - 1)] * (n_cols - 1)
     table = ax.table(cellText=cell_text, colLabels=col_labels, cellLoc="center", colWidths=col_widths,
                       loc="center")
     table.auto_set_font_size(False)
-    table.set_fontsize(7.5)
+    table.set_fontsize(8.5)
     table.scale(1, 1.5)
     for (r, c), cell in table.get_celld().items():
         if r == 0:
             cell.set_facecolor(theme.NAVY)
             cell.set_text_props(color="white", fontweight="bold")
         elif c == 0:
-            cell.set_text_props(ha="left", fontweight="bold" if row_labels[r - 1] in ("PBT", "PAT") else "normal")
+            cell.set_text_props(ha="left", fontweight="bold" if row_labels[r - 1] in
+                                ("PBT", "PAT", "UW Profit/(Loss)") else "normal")
             cell._loc = "left"
         cell.set_edgecolor(theme.GRID_COLOR)
     ax.set_title(title, fontsize=10, fontweight="bold", loc="left", pad=6)

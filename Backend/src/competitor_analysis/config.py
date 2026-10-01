@@ -313,6 +313,32 @@ def data_engine_output_path(fy: str = None, quarter: str = None) -> str:
     return str(paths.OUTPUT_DIR / f"Data_Engine_{fy}_{quarter}_{ts}.xlsx")
 
 
+_DATA_ENGINE_FILENAME_RE = re.compile(r"^Data_Engine_(FY\d{2}-\d{2})_(Q[1-4])_\d{8}_\d{6}\.xlsx$",
+                                       re.IGNORECASE)
+
+
+def parse_period_from_data_engine_path(path):
+    """Recovers (fy, quarter) from a data_engine_output_path()-style filename
+    (Data_Engine_{FY}_{Quarter}_{timestamp}.xlsx), or None if `path` doesn't
+    match that pattern - e.g. the legacy Data_Engine_UI.xlsx working file,
+    which carries no period in its name, or path=None.
+
+    reporting.report.build()'s captions (cur_period_label(), the TOC, every
+    slide title) all come from the live FY/QUARTER globals at render time,
+    never from the file actually being read - so a caller that renders a
+    Data Engine file without first confirming set_period() matches THAT
+    file's own period gets a PDF with correct numbers under the wrong
+    period's labels, with no error anywhere. build() uses this to
+    self-correct from the file's own name whenever it's parseable, rather
+    than trusting whatever the caller last left the global period at."""
+    if not path:
+        return None
+    m = _DATA_ENGINE_FILENAME_RE.match(os.path.basename(str(path)))
+    if not m:
+        return None
+    return normalize_fy(m.group(1)), m.group(2).upper()
+
+
 def period_label(fy: str = None, quarter: str = None) -> str:
     """'FY25-26 Q3' - display form. Q4 is the full financial year's close, so
     the quarter is omitted there ('FY25-26' alone) - every other quarter

@@ -42,6 +42,12 @@ LOGO_DIR = ASSETS_DIR / "logos"
 SOURCE_LINKS_FILE = DATA_DIR / "source_links.json"
 DATA_ENGINE_TEMPLATE = TEMPLATES_DIR / "Data_Engine_Template.xlsx"
 PROMPTS_DIR = PACKAGE_DIR / "prompts"
+# Multi-year trend tables (report.py's "Historical Trends" slide) - maintained
+# by hand, once a year, and placed here directly (see storage/s3.py's
+# restore_all(), which pulls it down on a fresh container the same way as
+# every other data/ input).
+HISTORICAL_DIR = DATA_DIR / "historical"
+HISTORICAL_TRENDS_WORKBOOK = HISTORICAL_DIR / "Historical_Trends.xlsx"
 
 # ---- outputs ------------------------------------------------------------
 ARTIFACTS_DIR = BACKEND_ROOT / "artifacts"

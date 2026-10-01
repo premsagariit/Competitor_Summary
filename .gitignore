@@ -8,9 +8,9 @@ Backend/.env
 # the cache and dated workbook snapshots are not.
 Backend/artifacts/cache/
 Backend/artifacts/output/Data_Engine_*.xlsx
-
-# Retrieved regulatory filings: durable storage is now Cloudflare R2
-# (competitor_analysis.storage.r2), synced automatically by the pipeline -
+.archify/
+# Retrieved regulatory filings: durable storage is now S3-compatible storage
+# (competitor_analysis.storage.s3), synced automatically by the pipeline -
 # not the repo, to keep it from growing every quarter.
 Backend/data/downloads/
 

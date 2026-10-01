@@ -644,7 +644,7 @@ def test_gemini_prefetch_reports_each_company(monkeypatch):
 def test_pdf_cache_survives_an_mtime_change(tmp_path, monkeypatch):
     """The cache must key on CONTENT, not mtime.
 
-    It is synced to R2 and restored onto a fresh container, and a download
+    It is synced to S3 and restored onto a fresh container, and a download
     rewrites mtime to "now" even when the bytes are identical. Keyed on
     mtime, the restored cache was discarded on first use and everything
     re-parsed - which would have made the whole sync pointless."""
@@ -670,7 +670,7 @@ def test_pdf_cache_survives_an_mtime_change(tmp_path, monkeypatch):
     pdf_cache.get_company_json(str(pdf), "TestCo")
     assert parses == ["TestCo"]
 
-    os.utime(pdf, (1, 1))                      # what an R2 restore looks like
+    os.utime(pdf, (1, 1))                      # what an S3 restore looks like
     pdf_cache.get_company_json(str(pdf), "TestCo")
     assert parses == ["TestCo"], "mtime change must not invalidate the cache"
 
@@ -679,7 +679,7 @@ def test_pdf_cache_survives_an_mtime_change(tmp_path, monkeypatch):
     assert parses == ["TestCo", "TestCo"], "changed content must re-parse"
 
 
-def test_r2_sync_covers_pdf_json_but_never_gemini(monkeypatch):
+def test_s3_sync_covers_pdf_json_but_never_gemini(monkeypatch):
     """The Gemini cache must never be persisted.
 
     Those are model answers, not derived facts: restoring them would serve
@@ -687,14 +687,14 @@ def test_r2_sync_covers_pdf_json_but_never_gemini(monkeypatch):
     The PDF cache is deterministic, so persisting it cannot change an
     answer - only the time it takes to get one."""
     from competitor_analysis import paths
-    from competitor_analysis.storage import r2
+    from competitor_analysis.storage import s3
 
     uploaded, downloaded = [], []
-    monkeypatch.setattr(r2, "upload_tree", lambda d: uploaded.append(str(d)))
-    monkeypatch.setattr(r2, "download_tree", lambda p: downloaded.append(str(p)))
+    monkeypatch.setattr(s3, "upload_tree", lambda d: uploaded.append(str(d)))
+    monkeypatch.setattr(s3, "download_tree", lambda p: downloaded.append(str(p)))
 
-    r2.sync_run_outputs()
-    r2.restore_all()
+    s3.sync_run_outputs()
+    s3.restore_all()
 
     up, down = " ".join(uploaded), " ".join(downloaded)
     assert "pdf_json" in up and "pdf_json" in down
