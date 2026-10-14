@@ -25,9 +25,16 @@ import logging
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 from competitor_analysis import paths
 
 logger = logging.getLogger(__name__)
+
+# The API imports this module before scraper/gemini (which are what call
+# load_dotenv), so without this the S3_* vars below are read as unset and
+# restore_all() silently no-ops - downloads never come back from the bucket.
+load_dotenv()
 
 _ACCOUNT_ID = os.getenv("S3_ACCOUNT_ID")
 _ACCESS_KEY = os.getenv("S3_ACCESS_KEY_ID")
